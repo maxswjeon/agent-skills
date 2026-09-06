@@ -53,6 +53,13 @@ BODY=$(jq -r '.body // ""' <<<"$pr")
 AUTHOR=$(jq -r '.user.login|ascii_downcase|rtrimstr("[bot]")' <<<"$pr")
 MERGED_AT=$(jq -r '.merged_at // ""' <<<"$pr")
 URL=$(jq -r .html_url <<<"$pr")
+HEAD_SHA=$(jq -r '.head.sha // ""' <<<"$pr")
+# HEAD's commit date, so a 👍 older than it can be labelled. The ORACLE owns the
+# freshness rule; this only stops the report asserting convergence on a signal the
+# oracle would reject. Non-fatal: an empty date skips the check rather than dying.
+HEAD_DATE=''
+[ -n "$HEAD_SHA" ] && HEAD_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" \
+  --jq '.commit.committer.date // ""' 2>/dev/null) || true
 ME=$(gh api user --jq '.login' 2>/dev/null | tr '[:upper:]' '[:lower:]') || ME=''
 
 # reviews: bot round count + latest non-bot approval
@@ -81,7 +88,13 @@ for cand in "T:${THUMB%%$'\t'*}" "A:${APPROVAL%%$'\t'*}" "C:$CLEAN"; do
   [ "${cand#*:}" \> "${best#*:}" ] && best=$cand
 done
 case "$best" in
-  T:?*) CONVERGED_BY="👍 from ${THUMB#*$'\t'} at ${THUMB%%$'\t'*}" ;;
+  T:?*) THUMB_AT=${THUMB%%$'\t'*}
+        CONVERGED_BY="👍 from ${THUMB#*$'\t'} at $THUMB_AT"
+        # A 👍 older than HEAD is the first entry in the skill's own Common Mistakes
+        # table. Say so rather than reporting it as a convergence.
+        [ -n "$HEAD_DATE" ] && [ "$THUMB_AT" \< "$HEAD_DATE" ] &&
+          CONVERGED_BY="$CONVERGED_BY — STALE, predates HEAD ($HEAD_DATE); the oracle does NOT converge on this"
+        ;;
   A:?*) CONVERGED_BY="GitHub approval from ${APPROVAL#*$'\t'} at ${APPROVAL%%$'\t'*}" ;;
   C:?*) CONVERGED_BY="bot replied 'no major issues' at $CLEAN" ;;
 esac
