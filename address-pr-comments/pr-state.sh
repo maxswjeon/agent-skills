@@ -98,6 +98,10 @@ done
 #   PR_OPEN HEAD_SHA HEAD_AT REVIEWED_SHA REVIEWED_AT EYES_AT THUMBS_AT THUMBS_BY CLEAN_AT
 #   APPROVED_AT HUMAN_CR_AT LAST_REPLY_AT TRIGGER_AT TRIGGER_COUNT BOT_SEEN
 #   ACTIONABLE BODY_PENDING CI_FAIL CI_PENDING MERGEABLE NOW
+# Rounds in a train: sorted epochs on stdin, those after $1 count; a row < 300s after the
+# previous one joins its round (chained, so a burst of reviews is one round).
+count_rounds() { sort -n | awk -v s="$1" '$1>s && (!n || $1-p>=300) {n++} $1>s {p=$1} END{print n+0}'; }
+
 decide() {
   EYES_ACTIVE=0
   [ "$EYES_AT" -gt 0 ] && [ "$EYES_AT" -gt "$REVIEWED_AT" ] && [ $((NOW - EYES_AT)) -lt "$EYES_TTL" ] && EYES_ACTIVE=1
@@ -197,6 +201,12 @@ if [ -n "${SELFTEST:-}" ]; then
                                       t wait "bot replied 'usage limit' after the request -> hold, don't re-ask"
   LIMIT_AT=$((NOW-4000)) TRIGGER_AT=$((NOW-5000))
                                       t trigger_review "usage-limit hold expired -> ask again"
+  r() { local got; got=$(printf '%s\n' $2 | count_rounds "$1")
+        if [ "$got" = "$3" ]; then echo "ok   $4"; else echo "FAIL $4: want $3 got $got"; RC=1; fi; }
+  r 0   "100 200 1000 1100 1350 1700" 3 "rounds: <300s chains merge (1000/1100/1350 is one round)"
+  r 150 "100 200 1000"                2 "rounds: only rows after the train start count"
+  r 5000 "100 200"                    0 "rounds: train start after every review -> 0"
+  r 0   ""                            0 "rounds: no reviews -> 0"
   TRIGGERS_HEAD=0 TRIGGER_COUNT=0 TRIGGER_AT=0 LIMIT_AT=0 HEAD_AT=$((NOW-1200)) REVIEWED_SHA='' REVIEWED_AT=0
   MERGEABLE=CONFLICTING;              t conflict "conflict outranks everything but a closed PR"
   PR_OPEN=0;                          t closed "closed PR -> stop"
@@ -312,14 +322,20 @@ snapshot() {
   # or a trigger must never count as an answer.
   local bot_re=${BOT//./\\.}
   comments=$(api --paginate "repos/$REPO/issues/$PRNUM/comments" --jq \
-    '.[] | [ ((.body // "")|ascii_downcase|test("^\\s*@('"$bot_re"'|codex)\\s+review\\b")|tostring),
+    'def marker: (.body // "")|ascii_downcase
+       | if test("^(## |> \\*\\*)") then sub("^(## |> \\*\\*)"; "") else "" end;
+     .[] | [ ((.body // "")|ascii_downcase|test("^\\s*@('"$bot_re"'|codex)\\s+review\\b")|tostring),
              (.user.login|test("\\[bot\\]$")|tostring),
              (.user.login|ascii_downcase|rtrimstr("[bot]")),
              .created_at,
              ((.body // "")|ascii_downcase|test("codex review: didn.t find any major issues")|tostring),
-             ((.body // "")|ascii_downcase|test("reached your codex usage limits")|tostring),
+             ((.body // "")|ascii_downcase|(test("reached (your|its) codex usage limits") and (test("security review")|not))|tostring),
              ((.body // "")|ascii_downcase|test("codex review: something went wrong")|tostring),
-             ((.body // "")|ascii_downcase|startswith("## review loop summary")|tostring) ] | @tsv') \
+             (marker|test("^(review (loop summary|train reset|train judge)|known limitations)")|tostring),
+             (marker|if startswith("review train reset") then "reset"
+                 elif startswith("review train judge") then "judge" else "-" end),
+             (marker|(capture("^review train judge . round (?<n>[0-9]+)").n) // "0"),
+             (marker|(capture("^review train judge . round [0-9]+: (?<v>[a-z]+)").v) // "-") ] | @tsv') \
     || { ERRMSG="comments: ${comments:0:200}"; return 1; }
   TRIGGER_AT=$(epoch "$(awk -F'\t' '$1=="true" && $2=="false"{print $4}' <<<"$comments" | sort | tail -n1)")
   TRIGGER_COUNT=$(awk -F'\t' '$1=="true" && $2=="false"' <<<"$comments" | grep -c .)
@@ -331,12 +347,13 @@ snapshot() {
     local at_e; at_e=$(epoch "$at")
     [ "$at_e" -ge "$HEAD_AT" ] && [ "$at_e" -gt "$REVIEWED_AT" ] && TRIGGERS_HEAD=$((TRIGGERS_HEAD+1))
   done <<<"$comments"
-  # The author-side answer clock excludes the loop's own convergence report ($8) — that
-  # comment must never "answer" a human CR or review body that raced the convergence.
+  # The author-side answer clock excludes the loop's own comments ($8: convergence report,
+  # train reset/judge markers, waive notice) — they must never "answer" a human CR or body.
   LAST_REPLY_AT=$(epoch "$(awk -F'\t' -v a="$AUTHOR" -v m="$ME" \
     '$1!="true" && $2=="false" && $8!="true" && ($3==a || (m!="" && $3==m)){print $4}' <<<"$comments" | sort | tail -n1)")
   CLEAN_AT=$(epoch "$(awk -F'\t' -v b="$BOT" '$2=="true" && $3==b && $5=="true"{print $4}' <<<"$comments" | sort | tail -n1)")
-  # "reached your Codex usage limits" — the bot answered the request with "no quota".
+  # "reached your/its Codex usage limits" — the bot answered the request with "no quota".
+  # Security-review limit replies are excluded: code review still runs and PRs converge.
   LIMIT_AT=$(epoch "$(awk -F'\t' -v b="$BOT" '$2=="true" && $3==b && $6=="true"{print $4}' <<<"$comments" | sort | tail -n1)")
   # Limit/error replies prove the bot is installed and talking — they must count as seen.
   local bot_replies; bot_replies=$(awk -F'\t' -v b="$BOT" '$2=="true" && $3==b && ($6=="true" || $7=="true")' <<<"$comments" | grep -c .)
@@ -375,6 +392,25 @@ snapshot() {
   CI_FAIL=$(jq '[.[]|select(.bucket=="fail" or .bucket=="cancel")]|length' <<<"$checks")
   CI_PENDING=$(jq '[.[]|select(.bucket=="pending")]|length' <<<"$checks")
 
+  # Review train: rounds since the latest "Review train reset" (else the first review).
+  # Control markers open with "> **" (blockquote) or "## " (older PRs); `marker` strips either.
+  # A round is a bot review (reviews < 300s apart merge into one) or a "no major issues"
+  # reply. LAST_JUDGED is the newest "Review train judge — round N" in this train.
+  # Only the PR author or the operator ($ME) can post these control markers.
+  local ctl; ctl=$(awk -F'\t' -v a="$AUTHOR" -v m="$ME" '$2=="false" && ($3==a || (m!="" && $3==m))' <<<"$comments")
+  TRAIN_START=$(epoch "$(awk -F'\t' '$9=="reset"{print $4}' <<<"$ctl" | sort | tail -n1)")
+  TRAIN_ROUNDS=$( { cut -f5 <<<"$bot_rows"
+                    awk -F'\t' -v b="$BOT" '$2=="true" && $3==b && $5=="true"{print $4}' <<<"$comments"; } \
+    | grep . | while read -r t; do epoch "$t"; done | count_rounds "$TRAIN_START")
+  local judged; judged=$(awk -F'\t' '$9=="judge"{print $4"\t"$10"\t"$11}' <<<"$ctl" \
+    | while IFS=$'\t' read -r at n v; do [ "$(epoch "$at")" -gt "$TRAIN_START" ] && printf '%s\t%s\n' "$n" "$v"; done \
+    | sort -n | tail -n1)
+  LAST_JUDGED=${judged%%$'\t'*}; LAST_JUDGED=${LAST_JUDGED:-0}
+  LAST_VERDICT=${judged#*$'\t'}; [ -n "$judged" ] || LAST_VERDICT=''
+  # A STOP verdict is terminal the moment it is posted, before the label lands: a crash
+  # between the two must not resume reviewing.
+  WAIVED=$(jq --arg v "$LAST_VERDICT" '([.labels[].name]|index("review-waived")!=null) or $v=="stop"' <<<"$pr")
+
   BOT_SEEN=0
   { [ "$BOT_REVIEWS" -gt 0 ] || [ "$bot_reactions" -gt 0 ] || [ "$CLEAN_AT" -gt 0 ] || [ "$bot_replies" -gt 0 ]; } && BOT_SEEN=1
 
@@ -399,6 +435,9 @@ emit() {
     --argjson approved_at "$APPROVED_AT" --argjson human_cr_at "$HUMAN_CR_AT" \
     --argjson trigger_pending "$TRIGGER_PENDING" --argjson trigger_count "$TRIGGER_COUNT" \
     --argjson triggers_head "$TRIGGERS_HEAD" --argjson bot_seen "$BOT_SEEN" \
+    --argjson train_start "${TRAIN_START:-0}" --argjson train_rounds "${TRAIN_ROUNDS:-0}" \
+    --argjson last_judged "${LAST_JUDGED:-0}" --argjson waived "${WAIVED:-false}" \
+    --arg last_verdict "${LAST_VERDICT:-}" \
     '{repo:$repo, pr:$pr, action:$action, reason:$reason,
       head:$head, head_reviewed:($reviewed==$head), reviewed:$reviewed, head_age_s:$head_age,
       unresolved:$unresolved, actionable:$actionable, answered_open:$answered_open,
@@ -408,7 +447,11 @@ emit() {
       thumbs_fresh:($thumbs_fresh==1), thumbs_by:$thumbs_by, converged_by:$converged_by,
       human_approved:($approved_at>0), human_changes_requested:($human_cr_at>0),
       trigger_pending:($trigger_pending==1), trigger_count:$trigger_count,
-      triggers_head:$triggers_head, bot_seen:($bot_seen==1)}'
+      triggers_head:$triggers_head, bot_seen:($bot_seen==1),
+      train_start:(if $train_start>0 then ($train_start|todate) else null end),
+      train_rounds:$train_rounds, last_judged_round:$last_judged,
+      judge_due:(($train_rounds/5|floor) > ($last_judged/5|floor)),
+      last_verdict:(if $last_verdict=="" then null else ($last_verdict|ascii_upcase) end), waived:$waived}'
 }
 
 deadline=$(( $(date +%s) + TIMEOUT ))

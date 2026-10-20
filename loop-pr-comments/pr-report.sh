@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # pr-report.sh — deterministic data layer for the loop-pr-comments convergence report.
 #
-#   pr-report.sh <owner/repo> <pr> [--bot LOGIN] [--ignore SUBSTR]...
+#   pr-report.sh <owner/repo> <pr> [--bot LOGIN] [--ignore SUBSTR]... [--unresolved]
+#
+# --unresolved prints one JSON object per unresolved thread instead of the report:
+# {url, sev, t, path, state: answered_open|muted_open|unanswered, reply} — the waive comment's source.
 #
 # Journey/Fixed metrics are THREAD-derived: a CI-only fix or a review-body-only fix has
 # no thread and will not appear in the counts — carry those in Goal/Decisions prose.
@@ -31,6 +34,7 @@ die() { echo "pr-report.sh: $1" >&2; exit 1; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --bot) [ -n "${2:-}" ] || die "missing --bot value"; BOT=${2,,}; BOT=${BOT%\[bot\]}; shift ;;
+    --unresolved) UNRESOLVED=1 ;;
     --ignore) [ -n "${2:-}" ] && [ -n "${2//[[:space:]]/}" ] || die "empty --ignore phrase"
               IGNORE+=("$2"); shift ;;
     -*) die "unknown option: $1" ;;
@@ -111,12 +115,12 @@ threads=$(gh api graphql --paginate -f query='
       reviewThreads(first:50, after:$endCursor){
         pageInfo{ hasNextPage endCursor }
         nodes{ isResolved path
-               comments(first:50){ nodes{ author{ login } body } }
+               comments(first:50){ nodes{ author{ login } body url } }
                last: comments(last:1){ nodes{ author{ login } body } } }
       }}}}' -F owner="$OWNER" -F repo="$NAME" -F number="$PRNUM" --jq '
     .data.repository.pullRequest.reviewThreads.nodes[]
     | {resolved: .isResolved, path: (.path // ""),
-       c: [.comments.nodes[] | {a: ((.author.login // "")|ascii_downcase|rtrimstr("[bot]")), b: (.body // "")}],
+       c: [.comments.nodes[] | {a: ((.author.login // "")|ascii_downcase|rtrimstr("[bot]")), b: (.body // ""), u: (.url // "")}],
        l: (.last.nodes[0] // {} | {a: ((.author.login // "")|ascii_downcase|rtrimstr("[bot]")), b: (.body // "")})}' 2>&1) \
   || die "threads: ${threads:0:200}"
 
@@ -131,12 +135,12 @@ jq -sc --arg bot "$BOT" --arg author "$AUTHOR" --arg me "$ME" '
     | gsub("</?su[bp]>"; "") | gsub("!\\[[^\\]]*\\]\\([^)]*\\)"; "") | gsub("\\*"; "")
     | split("\n") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))
     | (.[0] // "(no comment)") | .[0:90];
-  def sev: (.c[0].b // "") | if test("P1 Badge") then "P1" elif test("P2 Badge") then "P2" elif test("P3 Badge") then "P3" else "-" end;
+  def sev: (.c[0].b // "") | if test("P0 Badge") then "P0" elif test("P1 Badge") then "P1" elif test("P2 Badge") then "P2" elif test("P3 Badge") then "P3" else "-" end;
   def sha: [ (.c + [.l])[] | select(authorside(.a)) | .b | scan("(?<![Nn]ot )[Ff]ixed in[^0-9a-f]{0,4}([0-9a-f]{6,40})") ]
            | flatten | (last // null) | if . == null then null else .[0:7] end;
   def lastreply: (.l.b // "") | split("\n") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))
                  | (.[0] // "") | .[0:160];
-  map({resolved, path, t: title, sev: sev, sha: sha, last_a: (.l.a // ""), reply: lastreply,
+  map({resolved, path, t: title, sev: sev, sha: sha, last_a: (.l.a // ""), reply: lastreply, url: (.c[0].u // ""),
        muted: ((((.path // "") + " " + (.c[0].b // "")) | ascii_downcase) as $hay | any($ig[]; inside($hay)))})
   | {findings: length,
      p1: (map(select(.sev == "P1")) | length),
@@ -145,13 +149,18 @@ jq -sc --arg bot "$BOT" --arg author "$AUTHOR" --arg me "$ME" '
      fixed: (map(select(.resolved and .sha != null)) | map({t, sha})),
      commits: ([ .[] | select(.resolved and .sha != null) | .sha ] | unique | length),
      resolved_other: (map(select(.resolved and .sha == null)) | map({t, path, reply})),
-     answered_open: (map(select((.resolved | not) and (.muted | not) and (.last_a as $a | $a == $author or ($me != "" and $a == $me)))) | map({t, path, reply})),
-     muted_open: (map(select((.resolved | not) and .muted)) | map({t, path})),
-     unanswered: (map(select((.resolved | not) and (.muted | not) and ((.last_a as $a | $a == $author or ($me != "" and $a == $me)) | not))) | map({t, path}))}
+     answered_open: (map(select((.resolved | not) and (.muted | not) and (.last_a as $a | $a == $author or ($me != "" and $a == $me)))) | map({t, path, reply, url, sev})),
+     muted_open: (map(select((.resolved | not) and .muted)) | map({t, path, reply, url, sev})),
+     unanswered: (map(select((.resolved | not) and (.muted | not) and ((.last_a as $a | $a == $author or ($me != "" and $a == $me)) | not))) | map({t, path, reply, url, sev}))}
 ' <<<"$threads" > "$D" || die "thread digest failed"
 
 FINDINGS=$(jq .findings "$D"); P1=$(jq .p1 "$D"); P2=$(jq .p2 "$D"); P3=$(jq .p3 "$D")
 COMMITS=$(jq .commits "$D")
+if [ "${UNRESOLVED:-0}" = 1 ]; then
+  jq -c '(.answered_open[] | .state="answered_open"), (.muted_open[] | .state="muted_open"),
+         (.unanswered[] | .state="unanswered")' "$D"
+  exit 0
+fi
 SEVSTR="$P1 P1, $P2 P2"; [ "$P3" -gt 0 ] && SEVSTR="$SEVSTR, $P3 P3"
 
 cat <<EOF
