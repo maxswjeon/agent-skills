@@ -84,11 +84,17 @@ CLEAN=$(gh api --paginate "repos/$REPO/issues/$PRNUM/comments" --jq \
   '.[] | select(.user.login|ascii_downcase|rtrimstr("[bot]") == "'"$BOT"'")
        | select(.body|ascii_downcase|test("codex review: didn.t find any major issues"))
        | .created_at' 2>/dev/null | sort | tail -n1)
+# the bot's sticky summary comment: code review completed, no findings, on HEAD's sha
+SUMMARY=$(gh api --paginate "repos/$REPO/issues/$PRNUM/comments" --jq \
+  '.[] | select(.user.login|ascii_downcase|rtrimstr("[bot]") == "'"$BOT"'")
+       | (.body // "" | capture("<!-- codex-review-state:v1 (?<j>\\{.*?\\}) -->").j | fromjson.code_review) as $c
+       | select($c.status=="completed" and $c.has_any_findings==false and $c.commit_sha=="'"$HEAD_SHA"'")
+       | .updated_at' 2>/dev/null | sort | tail -n1)
 
 # freshest of the three signals wins (ISO timestamps sort lexicographically);
 # the report labels the freshest signal — the ORACLE owns actual convergence.
 best=''; CONVERGED_BY=''
-for cand in "T:${THUMB%%$'\t'*}" "A:${APPROVAL%%$'\t'*}" "C:$CLEAN"; do
+for cand in "T:${THUMB%%$'\t'*}" "A:${APPROVAL%%$'\t'*}" "C:$CLEAN" "S:$SUMMARY"; do
   [ "${cand#*:}" \> "${best#*:}" ] && best=$cand
 done
 case "$best" in
@@ -101,6 +107,7 @@ case "$best" in
         ;;
   A:?*) CONVERGED_BY="GitHub approval from ${APPROVAL#*$'\t'} at ${APPROVAL%%$'\t'*}" ;;
   C:?*) CONVERGED_BY="bot replied 'no major issues' at $CLEAN" ;;
+  S:?*) CONVERGED_BY="bot summary: code review clean on HEAD ${HEAD_SHA:0:7} at $SUMMARY" ;;
 esac
 if [ -z "$CONVERGED_BY" ]; then
   [ -n "$MERGED_AT" ] && CONVERGED_BY="no reaction/approval — merged at $MERGED_AT" \
