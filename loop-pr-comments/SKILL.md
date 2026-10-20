@@ -322,13 +322,15 @@ gh pr comment <n> --repo <owner/repo> --body '@codex review'
 ```
 
 `trigger_review` already encodes: HEAD genuinely unreviewed (by the API's `head.sha`, not
-your checkout) or reviewed-but-quiet 30 min with no 👍 (the nudge); no live 👀 — an active
+your checkout) or reviewed-but-quiet 30 min with no 👍 (the nudge); no running review per
+the bot's summary comment (`code_review.status`) and no live 👀 — an active
 👀 is a **reliable** in-flight marker (it's swapped for the 👍 on completion, which is why
 settled PRs show none) and only expires via `--eyes-ttl` (1h) when one abnormally outlives
 its review; HEAD older than the 900s grace (observed bot latency 6–40 min); and no
 unanswered request outstanding (re-posts after `--retrigger-after`, 30 min). Convergence
-is decided by reaction freshness, never `reviewed == head` — the 👍 is a reaction, not a
-review object.
+is decided by the summary's sha-exact clean state (formats: `../address-pr-comments/codex-artifacts.md`)
+or by reaction freshness, never
+`reviewed == head` — the 👍 is a reaction, not a review object.
 
 ## Waiting
 
@@ -351,7 +353,7 @@ watcher also exits when observable state moves while non-actionable):
 
 Re-queueing cannot spin forever — the oracle's own escalations transition every wait
 state: a quiet reviewed HEAD gets nudged after 30 min, an unanswered request re-posts
-after 30 min, a stale 👀 expires after 1 h, a bot "usage limit" reply holds the trigger
+after 30 min, a stale 👀 or summary `running` expires after 1 h, a bot "usage limit" reply holds the trigger
 for `--limit-ttl` (1 h) then re-asks, and dead requests become `no_reviewer` (2 on a
 never-engaged PR, 3 unanswered on one HEAD). If the same `wait` reason survives ~4 hours
 of re-queues, something external is wrong — report it instead of re-queueing again.

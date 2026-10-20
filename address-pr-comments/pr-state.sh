@@ -40,14 +40,20 @@
 #   deliberate "answered, left open for a human" convention — reported as answered_open,
 #   never actionable. Codex review bodies are always ~621 chars of boilerplate; findings
 #   live in inline comments, so the body counts only after stripping the known template.
-#   A clean pass is a 👍 reaction or a "Didn't find any major issues" comment — there is
-#   no such thing as a clean review object.
+#   A clean pass is a 👍 reaction, a "Didn't find any major issues" comment, or the bot's
+#   sticky summary comment (<!-- codex-review-state:v1 {json} -->, edited in place) saying
+#   code_review completed with has_any_findings=false on HEAD's sha — there is no such
+#   thing as a clean review object. The summary's status=running is the in-flight marker.
+#   Observed formats, lifecycle and pitfalls: codex-artifacts.md beside this script.
 #
 # Requires bash 4+ and GNU date (Linux). Not portable to stock macOS bash/BSD date.
 #
 # Known limitations (deliberate):
 #   - HEAD age uses the commit's committer date, not push time: pushing a pre-built commit
 #     ages it instantly past --grace and can make an old 👍 look fresh. Rare; accepted.
+#     The summary's clean signal is sha-exact and immune; PRs predating it are not.
+#   - A summary status other than running/completed (limits, crashes) is not interpreted —
+#     it falls through to the older signals and is surfaced as .code_review.status.
 #   - `gh pr checks` failures (auth loss, no checks configured) read as "no checks";
 #     CI gating then rests on the review channels alone. A converging signal with CI
 #     stuck pending waits forever here — the loop's ~4h same-reason escalation is the cap.
@@ -96,6 +102,7 @@ done
 # ---------------------------------------------------------------- decision
 # Pure function over the globals below, so --self-test can drive it directly.
 #   PR_OPEN HEAD_SHA HEAD_AT REVIEWED_SHA REVIEWED_AT EYES_AT THUMBS_AT THUMBS_BY CLEAN_AT
+#   CODE_STATUS CODE_SHA CODE_FINDINGS SEC_UNRESOLVED SUMMARY_AT
 #   APPROVED_AT HUMAN_CR_AT LAST_REPLY_AT TRIGGER_AT TRIGGER_COUNT BOT_SEEN
 #   ACTIONABLE BODY_PENDING CI_FAIL CI_PENDING MERGEABLE NOW
 # Rounds in a train: sorted epochs on stdin, those after $1 count; a row < 300s after the
@@ -105,10 +112,20 @@ count_rounds() { sort -n | awk -v s="$1" '$1>s && (!n || $1-p>=300) {n++} $1>s {
 decide() {
   EYES_ACTIVE=0
   [ "$EYES_AT" -gt 0 ] && [ "$EYES_AT" -gt "$REVIEWED_AT" ] && [ $((NOW - EYES_AT)) -lt "$EYES_TTL" ] && EYES_ACTIVE=1
+  # The summary's "running" is TTL'd off its last edit like 👀, so a wedged run can't livelock.
+  RUNNING=0
+  [ "$CODE_STATUS" = running ] && [ $((NOW - SUMMARY_AT)) -lt "$EYES_TTL" ] && RUNNING=1
+  # Only a literal false converges: has_any_findings is null while a review runs. A usage-limit
+  # reply on this HEAD disqualifies it — Codex has flipped the row to Completed (and even 👍'd)
+  # with no review behind it (sachiniyer/agent-factory#4052).
+  SUMMARY_CLEAN=0
+  [ "$CODE_STATUS" = completed ] && [ "$CODE_SHA" = "$HEAD_SHA" ] && [ "$CODE_FINDINGS" = false ] \
+    && [ "$SEC_UNRESOLVED" != true ] && [ "$LIMIT_AT" -le "$HEAD_AT" ] && SUMMARY_CLEAN=1
   # A 👍 older than HEAD approved an older commit — it does not converge this HEAD.
   THUMBS_FRESH=0; [ "$THUMBS_AT" -gt "$HEAD_AT" ] && THUMBS_FRESH=1
   CONVERGED_BY=''
-  if   [ "$THUMBS_FRESH" = 1 ];           then CONVERGED_BY="fresh 👍 (${THUMBS_BY:-bot})"
+  if   [ "$SUMMARY_CLEAN" = 1 ];          then CONVERGED_BY="summary: code review clean on HEAD"
+  elif [ "$THUMBS_FRESH" = 1 ];           then CONVERGED_BY="fresh 👍 (${THUMBS_BY:-bot})"
   elif [ "$CLEAN_AT" -gt "$HEAD_AT" ];    then CONVERGED_BY="bot replied: no major issues"
   elif [ "$APPROVED_AT" -gt "$HEAD_AT" ]; then CONVERGED_BY="human approval"
   fi
@@ -135,6 +152,7 @@ decide() {
        ACTION=wait; REASON="bot hit its usage limit $((NOW - LIMIT_AT))s ago — holding ${LIMIT_TTL}s before asking again"
   # An active 👀 is a RELIABLE in-flight marker — it outranks the no_reviewer stops: a
   # reviewer that finally starts after 3 aged requests must not be declared absent.
+  elif [ "$RUNNING" = 1 ];             then ACTION=wait; REASON="summary says code review running — review in flight"
   elif [ "$EYES_ACTIVE" = 1 ];         then ACTION=wait; REASON="👀 newer than last review — review in flight"
   elif [ "$BOT_SEEN" = 0 ] && [ "$TRIGGER_COUNT" -ge 2 ] && [ "$trigger_stale" = 1 ]; then
        ACTION=no_reviewer; REASON="$TRIGGER_COUNT review requests and the bot has never touched this PR"
@@ -160,6 +178,7 @@ if [ -n "${SELFTEST:-}" ]; then
   HEAD_SHA=aaa HEAD_AT=$((NOW-1200)) REVIEWED_SHA='' REVIEWED_AT=0
   EYES_AT=0 THUMBS_AT=0 THUMBS_BY='' CLEAN_AT=0 APPROVED_AT=0 LIMIT_AT=0
   TRIGGER_AT=0 TRIGGER_COUNT=0 TRIGGERS_HEAD=0 BOT_SEEN=1
+  CODE_STATUS='' CODE_SHA='' CODE_FINDINGS='' SEC_UNRESOLVED='' SUMMARY_AT=0
   t trigger_review "fresh PR, no review, no eyes -> trigger"
   EYES_AT=$((NOW-60));                t wait "eyes with no review yet (fresh-PR auto-review) -> wait"
   REVIEWED_SHA=old REVIEWED_AT=$((NOW-30)); t trigger_review "eyes OLDER than last review is stale -> trigger"
@@ -189,6 +208,17 @@ if [ -n "${SELFTEST:-}" ]; then
   APPROVED_AT=0; CLEAN_AT=$((NOW-100)); t converged "bot 'no major issues' comment -> converged"
   MERGEABLE=UNKNOWN;                  t wait "converging signal while mergeability UNKNOWN -> wait, not converged"
   MERGEABLE=MERGEABLE CLEAN_AT=0
+  CODE_STATUS=completed CODE_SHA=aaa CODE_FINDINGS=false
+                                      t converged "summary clean on HEAD's sha -> converged"
+  SEC_UNRESOLVED=true;                t wait "summary clean but security findings open -> no converge"
+  SEC_UNRESOLVED='' LIMIT_AT=$((NOW-100)); t wait "summary clean after a usage-limit reply on HEAD -> no converge"
+  LIMIT_AT=0
+  SEC_UNRESOLVED='' CODE_SHA=old;     t wait "summary clean on an older sha -> no converge"
+  CODE_SHA=aaa CODE_FINDINGS=null;    t wait "has_any_findings null -> no converge"
+  CODE_STATUS=running SUMMARY_AT=$((NOW-60)) REVIEWED_AT=$((NOW-2500))
+                                      t wait "summary running -> review in flight, no nudge"
+  SUMMARY_AT=$((NOW-4000));           t trigger_review "summary running past --eyes-ttl -> nudge"
+  CODE_STATUS='' CODE_SHA='' CODE_FINDINGS='' SUMMARY_AT=0 REVIEWED_AT=$((NOW-600))
   BOT_SEEN=0 TRIGGER_COUNT=2 TRIGGERS_HEAD=2 TRIGGER_AT=$((NOW-2000)) REVIEWED_SHA='' REVIEWED_AT=0
                                       t no_reviewer "2 STALE triggers, bot never engaged -> no_reviewer"
   TRIGGER_AT=$((NOW-60));             t wait "2nd trigger still fresh -> wait, not no_reviewer"
@@ -282,6 +312,7 @@ snapshot() {
              .state, (.commit_id // ""), (.submitted_at // ""),
              ( (.body // "")
                | gsub("<details>[\\s\\S]*</details>"; "")
+               | gsub("<!--[\\s\\S]*?-->"; "")
                | gsub("### 💡 Codex[^\n]*Review"; "")
                | gsub("Here are some automated[^\n]*review suggestions for this pull request."; "")
                | gsub("\\*\\*Reviewed commit:\\*\\*[^\n]*"; "")
@@ -321,21 +352,27 @@ snapshot() {
   # triggers. LAST_REPLY_AT is the AUTHOR side answering feedback — a reviewer's comment
   # or a trigger must never count as an answer.
   local bot_re=${BOT//./\\.}
+  # The sticky summary always names "Security Review" and the trigger phrases, so its body
+  # is blanked for the phrase columns ($5-$7) and only feeds the state JSON ($12, $13).
   comments=$(api --paginate "repos/$REPO/issues/$PRNUM/comments" --jq \
     'def marker: (.body // "")|ascii_downcase
        | if test("^(## |> \\*\\*)") then sub("^(## |> \\*\\*)"; "") else "" end;
+     def summary: (.body // "")|contains("<!-- codex-pull-request-review-summary -->");
+     def prose: if summary then "" else (.body // "")|ascii_downcase end;
      .[] | [ ((.body // "")|ascii_downcase|test("^\\s*@('"$bot_re"'|codex)\\s+review\\b")|tostring),
              (.user.login|test("\\[bot\\]$")|tostring),
              (.user.login|ascii_downcase|rtrimstr("[bot]")),
              .created_at,
-             ((.body // "")|ascii_downcase|test("codex review: didn.t find any major issues")|tostring),
-             ((.body // "")|ascii_downcase|(test("reached (your|its) codex usage limits") and (test("security review")|not))|tostring),
-             ((.body // "")|ascii_downcase|test("codex review: something went wrong")|tostring),
+             (prose|test("codex review: didn.t find any major issues")|tostring),
+             (prose|(test("reached (your|its) codex usage limits") and (test("security review")|not))|tostring),
+             (prose|test("codex review: something went wrong")|tostring),
              (marker|test("^(review (loop summary|train reset|train judge)|known limitations)")|tostring),
              (marker|if startswith("review train reset") then "reset"
                  elif startswith("review train judge") then "judge" else "-" end),
              (marker|(capture("^review train judge . round (?<n>[0-9]+)").n) // "0"),
-             (marker|(capture("^review train judge . round [0-9]+: (?<v>[a-z]+)").v) // "-") ] | @tsv') \
+             (marker|(capture("^review train judge . round [0-9]+: (?<v>[a-z]+)").v) // "-"),
+             (if summary then ((.body|capture("<!-- codex-review-state:v1 (?<j>\\{.*?\\}) -->").j) // "-") else "-" end),
+             (.updated_at // "") ] | @tsv') \
     || { ERRMSG="comments: ${comments:0:200}"; return 1; }
   TRIGGER_AT=$(epoch "$(awk -F'\t' '$1=="true" && $2=="false"{print $4}' <<<"$comments" | sort | tail -n1)")
   TRIGGER_COUNT=$(awk -F'\t' '$1=="true" && $2=="false"' <<<"$comments" | grep -c .)
@@ -357,6 +394,13 @@ snapshot() {
   LIMIT_AT=$(epoch "$(awk -F'\t' -v b="$BOT" '$2=="true" && $3==b && $6=="true"{print $4}' <<<"$comments" | sort | tail -n1)")
   # Limit/error replies prove the bot is installed and talking — they must count as seen.
   local bot_replies; bot_replies=$(awk -F'\t' -v b="$BOT" '$2=="true" && $3==b && ($6=="true" || $7=="true")' <<<"$comments" | grep -c .)
+  # Newest-edited summary; absent or malformed JSON leaves every field empty (no signal).
+  local st; st=$(awk -F'\t' -v b="$BOT" '$2=="true" && $3==b && $12!="-"{print $13"\t"$12}' <<<"$comments" | sort | tail -n1)
+  SUMMARY_AT=$(epoch "${st%%$'\t'*}")
+  CODE_STATUS='' CODE_SHA='' CODE_FINDINGS='' SEC_UNRESOLVED=''
+  [ -n "$st" ] && IFS=$'\t' read -r CODE_STATUS CODE_SHA CODE_FINDINGS SEC_UNRESOLVED < <(jq -r \
+    '[.code_review.status // "", .code_review.commit_sha // "", (.code_review.has_any_findings|tostring),
+      (.security_review.has_unresolved_findings|tostring)] | @tsv' <<<"${st#*$'\t'}" 2>/dev/null)
   BODY_PENDING=0
   [ "$head_body" = 1 ] && [ "$LAST_REPLY_AT" -le "$REVIEWED_AT" ] && BODY_PENDING=1
 
@@ -412,7 +456,7 @@ snapshot() {
   WAIVED=$(jq --arg v "$LAST_VERDICT" '([.labels[].name]|index("review-waived")!=null) or $v=="stop"' <<<"$pr")
 
   BOT_SEEN=0
-  { [ "$BOT_REVIEWS" -gt 0 ] || [ "$bot_reactions" -gt 0 ] || [ "$CLEAN_AT" -gt 0 ] || [ "$bot_replies" -gt 0 ]; } && BOT_SEEN=1
+  { [ "$BOT_REVIEWS" -gt 0 ] || [ "$bot_reactions" -gt 0 ] || [ "$CLEAN_AT" -gt 0 ] || [ "$bot_replies" -gt 0 ] || [ -n "$st" ]; } && BOT_SEEN=1
 
   NOW=$(date +%s)
   decide
@@ -438,6 +482,7 @@ emit() {
     --argjson train_start "${TRAIN_START:-0}" --argjson train_rounds "${TRAIN_ROUNDS:-0}" \
     --argjson last_judged "${LAST_JUDGED:-0}" --argjson waived "${WAIVED:-false}" \
     --arg last_verdict "${LAST_VERDICT:-}" \
+    --arg code_status "${CODE_STATUS:-}" --arg code_sha "${CODE_SHA:-}" --arg code_findings "${CODE_FINDINGS:-}" \
     '{repo:$repo, pr:$pr, action:$action, reason:$reason,
       head:$head, head_reviewed:($reviewed==$head), reviewed:$reviewed, head_age_s:$head_age,
       unresolved:$unresolved, actionable:$actionable, answered_open:$answered_open,
@@ -445,6 +490,8 @@ emit() {
       review_body_pending:($body_pending==1), ci_failing:$ci_fail, ci_pending:$ci_pending,
       mergeable:$mergeable, eyes_active:($eyes_active==1),
       thumbs_fresh:($thumbs_fresh==1), thumbs_by:$thumbs_by, converged_by:$converged_by,
+      code_review:(if $code_status=="" then null else
+        {status:$code_status, sha:$code_sha, findings:$code_findings} end),
       human_approved:($approved_at>0), human_changes_requested:($human_cr_at>0),
       trigger_pending:($trigger_pending==1), trigger_count:$trigger_count,
       triggers_head:$triggers_head, bot_seen:($bot_seen==1),
@@ -460,7 +507,7 @@ while :; do
   if snapshot; then
     FAILS=0
     [ "$WAIT" = 0 ] && { emit; exit 0; }
-    fp="$ACTION|$HEAD_SHA|$REVIEWED_SHA|$ACTIONABLE|$CI_FAIL|$MERGEABLE|$THUMBS_AT|$APPROVED_AT|$CLEAN_AT|$LIMIT_AT"
+    fp="$ACTION|$HEAD_SHA|$REVIEWED_SHA|$ACTIONABLE|$CI_FAIL|$MERGEABLE|$THUMBS_AT|$APPROVED_AT|$CLEAN_AT|$LIMIT_AT|$CODE_STATUS|$CODE_SHA"
     if [ "$ACTION" != wait ]; then emit; exit 0; fi
     if [ -n "$prev" ] && [ "$fp" != "$prev" ]; then emit; exit 0; fi
     prev=$fp

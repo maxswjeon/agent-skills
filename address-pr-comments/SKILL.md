@@ -25,7 +25,7 @@ STATE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/address-pr-comments/pr-state.s
 | `address` | failing CI, **actionable** threads (reviewer spoke last), unanswered review body, or an unanswered human CHANGES_REQUESTED | steps 2–7 |
 | `conflict` | branch conflicts with base | resolve the conflict first |
 | `trigger_review` | HEAD needs a review pass and nobody is on it (also fires as a **nudge** when a reviewed HEAD sat quiet 30 min with no 👍) | step 8 |
-| `converged` | 👍 / human GitHub approval / bot "no major issues" reply, **newer than HEAD**, CI finished, nothing open | label the PR (step 9) — then stop |
+| `converged` | bot summary "code review completed, no findings" **on HEAD's sha**, or 👍 / human GitHub approval / bot "no major issues" reply **newer than HEAD**; CI finished, nothing open | label the PR (step 9) — then stop |
 | `no_reviewer` | ≥2 aged requests on a PR the bot never touched (engagement is per-author/per-install), or ≥3 unanswered requests on the current HEAD (reviewer went dark) | stop; tell the user this PR has no working reviewer |
 | `wait` | review in flight / already asked / HEAD too fresh / 👍'd but CI still running | do nothing |
 | `closed` | PR merged or closed | stop |
@@ -40,7 +40,8 @@ thread with an author-side reply is how deliberate deferrals are recorded.
 The other fields (`unanswered_by_bot`, `ci_failing`, `ci_pending`,
 `mergeable`, `head_reviewed`, `eyes_active`, `thumbs_fresh`, `thumbs_by`, `converged_by`,
 `human_approved`, `human_changes_requested`, `review_body_pending`, `bot_seen`,
-`trigger_count`, `triggers_head`) are the evidence behind the decision — quote them in
+`trigger_count`, `triggers_head`, `code_review` — the summary comment's `{status, sha,
+findings}`, `null` on PRs that predate it) are the evidence behind the decision — quote them in
 your report instead of re-querying.
 
 `--ignore "<substr>"` (repeatable) additionally drops threads whose path or first comment
@@ -96,7 +97,7 @@ Notes:
 - A thread whose **last** comment is the bot (no reply after it) is unaddressed, even on an *earlier* commit. `pr-state.sh` reports this as `unanswered_by_bot`; add `last: comments(last:1){ nodes{ author{login} } }` above if you want it per-thread.
 - `comments(first: 50)` truncates a long thread: the reply you're looking for may be comment 51. Use `last: comments(last:1)` for "who spoke last", not the first-50 list.
 
-**B. Free-form review bodies** — entire reviews where the feedback is in the review's `body` itself, not as a line-attached comment. **These do not appear in `reviewThreads`.** Codex sometimes posts this way, especially when its target is a region rather than a single line. Know the shape: every Codex review body carries the same fixed boilerplate ("### 💡 Codex Review … `<details>` footer") regardless of finding count — body *length* means nothing — and a clean pass creates **no review object at all** (just a 👍, or a "Didn't find any major issues" issue comment on manual trigger). The oracle strips the template and only sets `review_body_pending` when real prose remains, so trust its flag; when reading bodies yourself, strip the header and footer first:
+**B. Free-form review bodies** — entire reviews where the feedback is in the review's `body` itself, not as a line-attached comment. **These do not appear in `reviewThreads`.** Codex sometimes posts this way, especially when its target is a region rather than a single line. Know the shape: every Codex review body carries the same fixed boilerplate ("### 💡 Codex Review … `<details>` footer") regardless of finding count — body *length* means nothing — and a clean pass creates **no review object at all** (a 👍, a "Didn't find any major issues" issue comment on manual trigger, and the summary comment flipping to completed with `has_any_findings: false`). Bodies now open with `<!-- codex-review-receipt:v1 -->`; the oracle strips HTML comments too. Every Codex artifact's exact shape, lifecycle and known pitfalls are in [`codex-artifacts.md`](codex-artifacts.md) — check it first when the bot's output looks unfamiliar, and update it with the oracle when Codex changes format. The oracle strips the template and only sets `review_body_pending` when real prose remains, so trust its flag; when reading bodies yourself, strip the header and footer first:
 
 ```bash
 gh api repos/<owner>/<repo>/pulls/<n>/reviews \
@@ -112,7 +113,7 @@ gh api repos/<owner>/<repo>/issues/<n>/comments \
   --jq '.[] | {id, user: .user.login, body, created_at}'
 ```
 
-Most are bot summaries (Socket, CI, dependency audits) — skip unless they raise an actionable issue.
+Most are bot summaries (Socket, CI, dependency audits) — skip unless they raise an actionable issue. Codex's own `<!-- codex-pull-request-review-summary -->` comment (one per PR, edited in place, a status table plus a `<!-- codex-review-state:v1 {json} -->` line) and its `<!-- codex-review-receipt:v1 -->` replies are status, never feedback: findings still arrive as review threads.
 
 **D. CI / check-run status** — a **failing required check is actionable feedback**, just like a review comment. `pr-state.sh` gives you `ci_failing`/`ci_pending`; fetch the rows when you need to know *which* check:
 
@@ -272,6 +273,9 @@ Two facts the oracle encodes that hand-rolled checks get wrong:
 - **`git rev-parse HEAD` is not the PR's head.** It's your local checkout — wrong after a
   failed push, in a different worktree, or when someone else pushed. The oracle uses
   `.head.sha` from the API.
+- **The summary comment's `code_review.status: running` means a review is running** — the
+  oracle checks it before 👀, TTL'd off the comment's last edit by `--eyes-ttl`. Any other
+  status besides `completed` is not interpreted; read `code_review.status` and report it.
 - **An active 👀 reliably means a review is running — never trigger over one.** It's
   transient (swapped for the 👍/review on completion), so a 👀 that abnormally outlives
   its review (an errored bot run, a stray human 👀) would block forever; active = newer
