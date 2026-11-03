@@ -1,0 +1,15 @@
+# Allow-list: only original skills are tracked. Everything else here is a symlink to
+# another package (korean-contracts, orchestrate), Anthropic's synced skills, a local copy
+# of a third-party skill (contract-review-questions, unlicensed upstream), or tool state.
+# A new original skill needs its own `!/<name>/` line.
+/*
+!/.gitignore
+!/README.md
+!/address-pr-comments/
+!/cleanup-worktree/
+!/loop-pr-comments/
+
+# local backups and caches
+*.bak
+*.bak-*
+__pycache__/
