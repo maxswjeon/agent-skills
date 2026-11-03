@@ -20,11 +20,12 @@
 #      `gh pr checks`) and review threads (threads_rest). REST has no resolution state;
 #      it comes from a per-PR cache refreshed by every GraphQL thread read, trusted only
 #      while the thread's comment count is unchanged. A bare "Unresolve" click is still
-#      invisible to REST, so the oracle never reports `converged` from REST threads.
+#      invisible to REST, so pr-state.sh confirms a REST-derived `converged` over GraphQL
+#      and reports `wait` when it can't.
 # PR_REVIEW_FORCE_REST=1 forces the REST paths (testing).
 
 for _v in GH_RL_MAX_WAIT GH_RL_DEADLINE PR_REVIEW_RESERVE_PCT; do   # they reach $((…))
-  [ -z "${!_v:-}" ] || [[ ${!_v} =~ ^[0-9]{1,10}$ ]] \
+  [ -z "${!_v:-}" ] || [[ ${!_v} =~ ^(0|[1-9][0-9]{0,9})$ ]] \
     || { jq -nc --arg e "$_v must be an integer" '{ok:false, action:"error", error:$e}'; exit 1; }
 done
 GH_RL_MAX_WAIT=${GH_RL_MAX_WAIT:-75}
@@ -36,6 +37,13 @@ rl_kind() {
   elif [[ $m == *"rate limit"* ]]; then echo primary
   elif [[ $m == *"http 429"* ]]; then echo secondary
   else echo none; fi
+}
+
+# rl_until <bucket> → " until <ISO reset>" (empty if unknown) — for error messages
+rl_until() {
+  local s i r; s=$(rl_status) || return 0
+  case $1 in core) i=2 ;; graphql) i=5 ;; *) i=8 ;; esac
+  r=$(cut -f"$i" <<<"$s"); [[ $r =~ ^[0-9]+$ ]] && printf ' until %s' "$(date -u -d "@$r" +%FT%TZ)"
 }
 
 # rl_status → "core_rem core_reset core_limit gql_rem gql_reset gql_limit search_rem search_reset"
@@ -59,7 +67,8 @@ ghx() {
     if [ "$kind" = none ] || [ -n "${GH_RL_NO_WAIT:-}" ]; then
       rm -f "$ef"
       [ -n "$out" ] && printf '%s\n' "$out"
-      [ -n "$err" ] && printf '%s%s\n' "$([ "$kind" != none ] && echo "rate limited ($res, $kind): ")" "$err" >&2
+      [ "$kind" != none ] && err="rate limited ($res, $kind)$(rl_until "$res"): $err"
+      [ -n "$err" ] && printf '%s\n' "$err" >&2
       return "$rc"
     fi
     now=$(date +%s)
@@ -70,7 +79,9 @@ ghx() {
         graphql) read -r _ _ _ rem reset _ <<<"$s" ;;
         search) read -r _ _ _ _ _ _ rem reset <<<"$s" ;;
       esac
-      w=$(( ${reset:-0} - now + 2 ))
+      if [ -z "${reset:-}" ]; then   # /rate_limit unreadable: back off like a secondary limit
+        w=$(( delay + RANDOM % 10 )); delay=$(( delay * 2 ))
+      else w=$(( reset - now + 2 )); fi
       # Budget left yet still limited (the reset just passed, or a costly query): retry
       # quickly once, then treat it like a secondary limit.
       if [ "${rem:-0}" -gt 0 ] 2>/dev/null; then

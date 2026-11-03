@@ -50,6 +50,7 @@ OWNER=${REPO%%/*}; NAME=${REPO##*/}
 command -v jq >/dev/null || die "jq not found"
 # gh api with rate-limit backoff (ghx); lives beside the oracle in address-pr-comments.
 . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../address-pr-comments/gh-rl.sh"
+export GH_RL_DEADLINE=${GH_RL_DEADLINE:-$(( $(date +%s) + 90 ))}   # fits the Bash tool's 120s
 
 IGNORE_JSON=$( [ ${#IGNORE[@]} -eq 0 ] && echo '[]' || printf '%s\n' "${IGNORE[@]}" | jq -Rc 'ascii_downcase' | jq -sc . )
 
@@ -64,9 +65,9 @@ HEAD_SHA=$(jq -r '.head.sha // ""' <<<"$pr")
 # freshness rule; this only stops the report asserting convergence on a signal the
 # oracle would reject. Non-fatal: an empty date skips the check rather than dying.
 HEAD_DATE=''
-[ -n "$HEAD_SHA" ] && HEAD_DATE=$(ghx "repos/$REPO/commits/$HEAD_SHA" --cache 24h \
+[ -n "$HEAD_SHA" ] && HEAD_DATE=$(ghx "repos/$REPO/commits/$HEAD_SHA" \
   --jq '.commit.committer.date // ""' 2>/dev/null) || true
-ME=$(ghx user --cache 24h --jq '.login' 2>/dev/null | tr '[:upper:]' '[:lower:]') || ME=''
+ME=$(ghx user --jq '.login' 2>/dev/null | tr '[:upper:]' '[:lower:]') || ME=''
 
 # reviews: bot round count + latest non-bot approval
 reviews=$(ghx --paginate "repos/$REPO/pulls/$PRNUM/reviews" --jq \

@@ -66,7 +66,7 @@ $WATCH <repo> <n> --wait --timeout 1800 [--interval N] [--ignore …]   # run_in
 ```
 
 It exits when there's something to do or the state moved, and its stdout is the oracle
-JSON. Polls are ETag probes that cost nothing while the PR is quiet; its interval stretches
+JSON. Polls are ETag probes, free while the PR is quiet (plus a full snapshot every 5 min); its interval stretches
 as the shared GitHub budget drains, and it waits out rate limits instead of failing. On a `timeout` (exit 10), `killed` (exit 143) or `wait`
 wake, go to step 2; still `wait` → relaunch. These re-queues are not iterations. One
 watcher at a time (check your background tasks first); never add Monitor, ScheduleWakeup

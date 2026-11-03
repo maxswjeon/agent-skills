@@ -266,6 +266,7 @@ if [ "$WAIT" = 1 ]; then
   # A killed watcher used to leave an empty task file and the caller guessing.
   # Say so on stdout instead, so the wake carries its own reason.
   wdie() {
+    [ -n "${SLEEP_PID:-}" ] && kill "$SLEEP_PID" 2>/dev/null
     wlog signal "SIG$1"
     [ "${EMITTED:-0}" = 1 ] || jq -nc --arg repo "$REPO" --argjson pr "$PRNUM" --arg s "$1" \
       '{repo:$repo, pr:$pr, action:"killed", reason:"SIG\($s) — watcher terminated externally, not a state change"}'
@@ -284,17 +285,18 @@ epoch() { [ -n "${1:-}" ] && [ "$1" != null ] && date -d "$1" +%s 2>/dev/null ||
 
 # api <args...> — echoes combined output; caller checks rc and uses the output as ERRMSG.
 # (Do NOT bump failure counters in here: every call site is a $(…) subshell.)
-# ghx (gh-rl.sh) = `timeout 120 gh api` + rate-limit backoff bounded by GH_RL_MAX_WAIT,
-# which --wait sets to the time left before its deadline.
+# ghx (gh-rl.sh) = `timeout 120 gh api` + rate-limit backoff bounded by GH_RL_DEADLINE:
+# ~90s for a snapshot, ≤75s per --wait iteration (longer waits are the loop's own sleep,
+# which a TERM can interrupt).
 . "$(dirname "${BASH_SOURCE[0]}")/gh-rl.sh"
 api() { ghx "$@" 2>&1; }
 
 # The operator account counts as the author side when classifying who spoke last.
-ME=''   # looked up in snapshot() until it succeeds; gh caches it for a day
+ME=''   # looked up in snapshot() until it succeeds
 
 snapshot() {
   ERRMSG=''; local pr reviews reactions comments threads checks cdate
-  [ -n "$ME" ] || ME=$(ghx user --cache 24h --jq '.login' 2>/dev/null | tr '[:upper:]' '[:lower:]') || ME=''
+  [ -n "$ME" ] || ME=$(ghx user --jq '.login' 2>/dev/null | tr '[:upper:]' '[:lower:]') || ME=''
   pr=$(api "repos/$REPO/pulls/$PRNUM") || { ERRMSG="pulls/$PRNUM: ${pr:0:200}"; return 1; }
   PR_OPEN=$(jq -r 'if .state=="open" then 1 else 0 end' <<<"$pr")
   HEAD_SHA=$(jq -r .head.sha <<<"$pr")
@@ -302,8 +304,14 @@ snapshot() {
   case "$(jq -r .mergeable_state <<<"$pr")" in
     dirty) MERGEABLE=CONFLICTING ;; unknown) MERGEABLE=UNKNOWN ;; *) MERGEABLE=MERGEABLE ;;
   esac
-  cdate=$(api "repos/$REPO/commits/$HEAD_SHA" --cache 24h --jq '.commit.committer.date') \
-    || { ERRMSG="commits/${HEAD_SHA:0:7}: ${cdate:0:200}"; return 1; }
+  # A sha's commit date never changes: fetch it once per HEAD (not gh --cache, which also
+  # stores error responses).
+  if [ "$HEAD_SHA" != "${CDATE_SHA:-}" ]; then
+    cdate=$(api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.committer.date') \
+      || { ERRMSG="commits/${HEAD_SHA:0:7}: ${cdate:0:200}"; return 1; }
+    CDATE_SHA=$HEAD_SHA CDATE=$cdate
+  fi
+  cdate=$CDATE
   HEAD_AT=$(epoch "$cdate")
   # HEAD_AT=0 would make every historical 👍 "fresh" -> false converged. Never proceed on it.
   [ "$HEAD_AT" -gt 0 ] || { ERRMSG="unparsable committer date: ${cdate:0:100}"; return 1; }
@@ -449,8 +457,9 @@ snapshot() {
   # confirmed over GraphQL (one cheap query, even at the reserve) before it is reported.
   if [ "$ACTION" = converged ] && [ "$THREADS_SRC" = rest ]; then
     local low=${GQL_LOW:-0}; GQL_LOW=0
+    # (Under PR_REVIEW_FORCE_REST=1, a test flag, the confirmation is REST too: always held.)
     if threads_read "$REPO" "$PRNUM" 1 && [ "$THREADS_SRC" = graphql ]; then count_threads; decide
-    else hold_rest_converge; fi
+    else THREADS_SRC=rest; hold_rest_converge; fi   # counts are still the REST read's
     GQL_LOW=$low
   fi
   return 0
@@ -531,8 +540,10 @@ SNAP_CORE=7 SNAP_GQL=2
 # ETag probe (watcher only): conditional GETs on everything decide() reads over REST. All
 # 304 (free) → nothing moved: re-run decide() on the last snapshot with a fresh clock, since
 # grace / retrigger / TTL windows are time-based. Any change, probe error, or a snapshot
-# older than FULL_EVERY → full snapshot. Thread resolution is GraphQL-only (no ETag); the
-# periodic full snapshot bounds how stale it can get. Comments are probed `since` the
+# older than FULL_EVERY → full snapshot. Seen only by that periodic snapshot (so at most
+# FULL_EVERY + one interval late): resolve/unresolve clicks (GraphQL-only, no ETag),
+# deleted comments from before SINCE, and items past page 1 of reviews or reactions
+# (though pulls/N's updated_at usually moves with a new review). Comments are probed `since` the
 # watcher started, so edits on any page show (the Codex summary is edited in place).
 FULL_EVERY=${PR_STATE_FULL_EVERY:-300}
 [[ $FULL_EVERY =~ ^[0-9]{1,6}$ ]] || die "PR_STATE_FULL_EVERY must be an integer"
@@ -550,15 +561,17 @@ probe_moved() { # → 0 if anything moved (or can't tell); probes every path so 
   return $moved
 }
 last_full=0 FULLS=0 CACHED=0
-if [ "$WAIT" = 1 ]; then
-  rl_interval "$INTERVAL" "$SNAP_CORE" "$SNAP_GQL"
-  GH_RL_DEADLINE=$deadline   # a rate limit inside a snapshot may be slept out, never past it
-  # Prime the ETags BEFORE the first snapshot, so nothing that moves in between is missed.
-  # HEAD's per-sha paths are unknown yet: the next probe sees them as new and takes one
-  # more snapshot, after which polls are free.
-  probe_moved || :
+# Polls are mostly free 304s, so the budget-aware interval charges a snapshot's cost
+# amortized over FULL_EVERY. The first probe has no ETags yet and so always takes the second
+# snapshot itself: everything that moved after the first one is caught there.
+POLL_CORE=$(( SNAP_CORE * INTERVAL / FULL_EVERY + 1 )) POLL_GQL=$(( SNAP_GQL * INTERVAL / FULL_EVERY + 1 ))
+if [ "$WAIT" = 1 ]; then rl_interval "$INTERVAL" "$POLL_CORE" "$POLL_GQL"
+else export GH_RL_DEADLINE=${GH_RL_DEADLINE:-$(( $(date +%s) + 90 ))}   # foreground snapshot
 fi
 while :; do
+  if [ "$WAIT" = 1 ]; then   # ghx may sleep out a limit for ≤75s; longer waits are ours, below
+    GH_RL_DEADLINE=$(( $(date +%s) + 75 )); [ "$GH_RL_DEADLINE" -gt "$deadline" ] && GH_RL_DEADLINE=$deadline
+  fi
   if [ "$WAIT" = 1 ] && [ "$last_full" -gt 0 ] && [ $(( $(date +%s) - last_full )) -lt "$FULL_EVERY" ] \
      && ! probe_moved; then
     NOW=$(date +%s); decide; hold_rest_converge; CACHED=$((CACHED+1)); got=1
@@ -585,10 +598,10 @@ while :; do
   [ "$left" -le 0 ] && {
     jq -nc --arg repo "$REPO" --argjson pr "$PRNUM" --argjson t "$TIMEOUT" \
       '{repo:$repo, pr:$pr, action:"timeout", reason:"no change in \($t)s"}'; exit 10; }
-  rl_interval "$INTERVAL" "$SNAP_CORE" "$SNAP_GQL"
+  rl_interval "$INTERVAL" "$POLL_CORE" "$POLL_GQL"
   [ "$RL_INTERVAL" -gt $(( INTERVAL * 4 )) ] && wlog budget "interval=${RL_INTERVAL}s gql_low=$GQL_LOW"
   # never sleep past the deadline — --timeout is a wall-clock bound. `& wait` keeps the
   # TERM trap responsive during long budget sleeps.
   [ "$left" -lt "$RL_INTERVAL" ] && RL_INTERVAL=$left
-  sleep "$RL_INTERVAL" & wait $!
+  sleep "$RL_INTERVAL" & SLEEP_PID=$!; wait "$SLEEP_PID"; SLEEP_PID=''
 done

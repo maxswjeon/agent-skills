@@ -79,7 +79,7 @@ parse_flags() {
     shift
   done
 }
-me() { ME=$(ghx user --cache 24h --jq '.login|ascii_downcase' 2>/dev/null) || ME=''; }   # gh caches the login
+me() { ME=$(ghx user --jq '.login|ascii_downcase' 2>/dev/null) || ME=''; }
 post_comment() { # body → {ok,url}; REST
   local out; out=$(ghx -X POST "repos/$REPO/issues/$PR/comments" -f body="$1" --jq '{ok:true,url:.html_url}' 2>&1) \
     || die "comment: ${out:0:300}"
@@ -163,6 +163,7 @@ cmd_resolve() {
     | {repo: $repo, pr: .number, url, state, head_ref: .headRefName, base_ref: .baseRefName,
        branch: $br, clean: $clean, checkout_ok: ($br == .headRefName and $clean)}' <<<"$v" \
     || die "could not parse the PR: ${v:0:200}"
+  [[ $(jq -r .url <<<"$v") == https://github.com/* ]] || die "only github.com PRs are supported: $(jq -r .url <<<"$v")"
 }
 
 cmd_feedback() {
@@ -254,7 +255,7 @@ cmd_reply() {
       if [ -z "$err" ] && [ "$res" = true ]; then
         # Resolving needs GraphQL: check the budget before posting anything, so a re-send is safe.
         g=$(rl_status | cut -f4)
-        [ "${g:-1}" -gt 0 ] 2>/dev/null || err="GraphQL rate limit exhausted; nothing posted — re-send after the reset"
+        [ "${g:-1}" -gt 0 ] 2>/dev/null || err="GraphQL rate limit exhausted$(rl_until graphql); nothing posted — re-send after the reset"
         src=$b
         if [ -z "$err" ] && [ -z "$b" ]; then   # resolve-only: our own last comment must cite the fix
           src=$(ghx graphql -f t="$t" -f query='query($t:ID!){ node(id:$t){ ... on PullRequestReviewThread{
@@ -262,7 +263,8 @@ cmd_reply() {
                 --jq '.data.node.comments.nodes[0] | ((.author.login // "") | ascii_downcase) + "\t" + (.body // "")' 2>&1) \
             || err="could not read the thread: ${src:0:200}"
           if [ -z "$err" ]; then
-            [ -n "$ME" ] && [ "${src%%$'\t'*}" = "$ME" ] || err="resolve-only needs your own 'Fixed in <sha>' reply as the thread's last comment"
+            if [ -z "$ME" ]; then err="could not read your login, so the thread's last comment can't be checked; try again"
+            elif [ "${src%%$'\t'*}" != "$ME" ]; then err="resolve-only needs your own 'Fixed in <sha>' reply as the thread's last comment"; fi
             src=${src#*$'\t'}
           fi
         fi
