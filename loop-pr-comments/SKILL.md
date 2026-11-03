@@ -370,8 +370,9 @@ advisory, not an atomic lease, so never run two sessions against the same PR.
 `review-converged` label (address-pr-comments step 9), remove `review-blocked` and
 `review-waived` (one `--remove-label … 2>/dev/null || true` call each), then produce the **convergence
 report** (below) — the loop's real deliverable. If the post-report oracle re-run comes
-back `address`, remove the label again and keep looping; the label tracks the oracle's
-current answer, not the first time it said `converged`.
+back `address`, remove the label again, hide the summary you just posted
+(address-pr-comments step 9), and keep looping; the label and the summary track the
+oracle's current answer, not the first time it said `converged`.
 
 **2. No progress** — two consecutive **address passes** with the same `actionable` count
 and the same HEAD: stop and say so. Trigger-only rounds are excluded (the oracle's
@@ -419,7 +420,9 @@ It fills every mechanical section — Journey numbers, Fixed (resolved threads w
 pass the loop's `--ignore` phrases so muted threads render there too) — plus a fenced
 `SOURCE MATERIAL` block (PR body, resolved-without-SHA threads, unanswered threads). Your
 job is exactly two `<FILL>` slots: **Goal** and **Decisions**. Then delete the SOURCE
-MATERIAL block, post the result as **one top-level PR comment**, and repeat it to the
+MATERIAL block, hide the earlier summaries as Outdated (the snippet in
+address-pr-comments step 9; hide first, so a crash before the post leaves nothing stale
+visible), post the result as **one top-level PR comment**, and repeat it to the
 user. Metrics are thread-derived — CI-only or review-body-only fixes have no thread;
 carry those in prose. **After posting, re-run the oracle once**: feedback that raced the
 convergence snapshot must be caught (the oracle deliberately ignores the report comment

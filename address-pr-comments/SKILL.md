@@ -306,6 +306,34 @@ If the PR later goes back to `address` (new findings, a red check), drop it agai
 (it errors when the label doesn't exist in the repo) — so the label always
 reflects the oracle's current answer rather than a moment in the past.
 
+**Hide outdated `## Review loop summary` comments.** The summary that `loop-pr-comments`
+posts is a convergence claim, like the label. Whenever you drop the label, also hide every
+visible summary as **Outdated** (`loop-pr-comments` runs the same snippet right before it
+posts a new summary, so only the current one stays visible). Rerunning is a no-op;
+`viewerCanMinimize` skips comments you can't hide (fork PRs) instead of failing:
+
+```bash
+gh api graphql --paginate -f query='
+query($owner:String!,$repo:String!,$number:Int!,$endCursor:String){
+  repository(owner:$owner,name:$repo){ pullRequest(number:$number){
+    comments(first:100, after:$endCursor){
+      pageInfo{ hasNextPage endCursor }
+      nodes{ id isMinimized viewerCanMinimize body } } } } }' \
+  -F owner=<owner> -F repo=<repo> -F number=<n> \
+  --jq '.data.repository.pullRequest.comments.nodes[]
+        | select(.viewerCanMinimize and (.isMinimized|not)
+                 and (.body|startswith("## Review loop summary"))) | .id' |
+while read -r id; do
+  gh api graphql -F id="$id" -f query='mutation($id:ID!){
+    minimizeComment(input:{subjectId:$id, classifier:OUTDATED}){ minimizedComment{ isMinimized } }
+  }' >/dev/null
+done
+```
+
+Hidden comments still come back from REST `issues/<n>/comments` with the same body, so
+the oracle's handling of loop comments is unchanged. Only hide summaries: judge, reset and
+`## Known limitations` comments are state the oracle and the judge read back.
+
 ## Common pitfalls
 
 - **Re-deriving state by hand instead of asking `pr-state.sh`.** Hand-rolled copies drift and answer differently on the same PR. One oracle, one answer.
