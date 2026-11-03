@@ -48,10 +48,12 @@ done
 [[ $BOT =~ ^[A-Za-z0-9._-]+$ ]] || die "bad --bot"
 OWNER=${REPO%%/*}; NAME=${REPO##*/}
 command -v jq >/dev/null || die "jq not found"
+# gh api with rate-limit backoff (ghx); lives beside the oracle in address-pr-comments.
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../address-pr-comments/gh-rl.sh"
 
 IGNORE_JSON=$( [ ${#IGNORE[@]} -eq 0 ] && echo '[]' || printf '%s\n' "${IGNORE[@]}" | jq -Rc 'ascii_downcase' | jq -sc . )
 
-pr=$(gh api "repos/$REPO/pulls/$PRNUM" 2>&1) || die "pulls/$PRNUM: ${pr:0:200}"
+pr=$(ghx "repos/$REPO/pulls/$PRNUM" 2>&1) || die "pulls/$PRNUM: ${pr:0:200}"
 TITLE=$(jq -r .title <<<"$pr")
 BODY=$(jq -r '.body // ""' <<<"$pr")
 AUTHOR=$(jq -r '.user.login|ascii_downcase|rtrimstr("[bot]")' <<<"$pr")
@@ -62,30 +64,30 @@ HEAD_SHA=$(jq -r '.head.sha // ""' <<<"$pr")
 # freshness rule; this only stops the report asserting convergence on a signal the
 # oracle would reject. Non-fatal: an empty date skips the check rather than dying.
 HEAD_DATE=''
-[ -n "$HEAD_SHA" ] && HEAD_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" \
+[ -n "$HEAD_SHA" ] && HEAD_DATE=$(ghx "repos/$REPO/commits/$HEAD_SHA" --cache 24h \
   --jq '.commit.committer.date // ""' 2>/dev/null) || true
-ME=$(gh api user --jq '.login' 2>/dev/null | tr '[:upper:]' '[:lower:]') || ME=''
+ME=$(ghx user --cache 24h --jq '.login' 2>/dev/null | tr '[:upper:]' '[:lower:]') || ME=''
 
 # reviews: bot round count + latest non-bot approval
-reviews=$(gh api --paginate "repos/$REPO/pulls/$PRNUM/reviews" --jq \
+reviews=$(ghx --paginate "repos/$REPO/pulls/$PRNUM/reviews" --jq \
   '.[] | [(.user.login|ascii_downcase|rtrimstr("[bot]")), (.user.login|test("\\[bot\\]$")|tostring), .state, (.submitted_at // "")] | @tsv' 2>&1) \
   || die "reviews: ${reviews:0:200}"
 ROUNDS=$(awk -F'\t' -v b="$BOT" '$1==b' <<<"$reviews" | grep -c .)
 APPROVAL=$(awk -F'\t' '$2=="false" && $3=="APPROVED"{print $4"\t"$1}' <<<"$reviews" | sort | tail -n1)
 
 # reactions: freshest converging 👍 (review bot, or any non-bot)
-reactions=$(gh api --paginate "repos/$REPO/issues/$PRNUM/reactions" --jq \
+reactions=$(ghx --paginate "repos/$REPO/issues/$PRNUM/reactions" --jq \
   '.[] | [.content, (.user.login|ascii_downcase|rtrimstr("[bot]")), (.user.login|test("\\[bot\\]$")|tostring), .created_at] | @tsv' 2>&1) \
   || die "reactions: ${reactions:0:200}"
 THUMB=$(awk -F'\t' -v b="$BOT" '$1=="+1" && ($2==b || $3=="false"){print $4"\t"$2}' <<<"$reactions" | sort | tail -n1)
 
 # the bot's clean "no major issues" issue comment is a converging signal too
-CLEAN=$(gh api --paginate "repos/$REPO/issues/$PRNUM/comments" --jq \
+CLEAN=$(ghx --paginate "repos/$REPO/issues/$PRNUM/comments" --jq \
   '.[] | select(.user.login|ascii_downcase|rtrimstr("[bot]") == "'"$BOT"'")
        | select(.body|ascii_downcase|test("codex review: didn.t find any major issues"))
        | .created_at' 2>/dev/null | sort | tail -n1)
 # the bot's sticky summary comment: code review completed, no findings, on HEAD's sha
-SUMMARY=$(gh api --paginate "repos/$REPO/issues/$PRNUM/comments" --jq \
+SUMMARY=$(ghx --paginate "repos/$REPO/issues/$PRNUM/comments" --jq \
   '.[] | select(.user.login|ascii_downcase|rtrimstr("[bot]") == "'"$BOT"'")
        | (.body // "" | capture("<!-- codex-review-state:v1 (?<j>\\{.*?\\}) -->").j | fromjson.code_review) as $c
        | select($c.status=="completed" and $c.has_any_findings==false and $c.commit_sha=="'"$HEAD_SHA"'")
@@ -116,7 +118,7 @@ fi
 
 # threads: one compact JSON object per thread. `last:1` is fetched separately so the
 # last-speaker classification survives threads longer than the first-50 comment page.
-threads=$(gh api graphql --paginate -f query='
+threads=$(ghx graphql --paginate -f query='
   query($owner:String!,$repo:String!,$number:Int!,$endCursor:String){
     repository(owner:$owner,name:$repo){ pullRequest(number:$number){
       reviewThreads(first:50, after:$endCursor){

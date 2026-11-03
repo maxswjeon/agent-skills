@@ -6,8 +6,10 @@
 #
 # Options:
 #   --wait                  poll until action != wait (or the state fingerprint moves)
-#   --interval N            poll seconds (default 5; a snapshot itself takes a few seconds
-#                           of API calls, so effective cadence is snapshot time + 5s)
+#   --interval N            base poll seconds (default 5). Each poll is an ETag probe (free
+#                           when nothing moved); a full snapshot runs only on a change or
+#                           every PR_STATE_FULL_EVERY s (300). The interval stretches as the
+#                           shared rate-limit budget drains (gh-rl.sh rl_interval).
 #   --timeout N             give up waiting after N seconds (default 1800 = 30 min; the
 #                           caller re-checks and re-queues while the wait is legitimate —
 #                           some reviews take hours)
@@ -248,7 +250,7 @@ fi
 [[ $REPO == */* ]] || die "repo must be owner/name, got: $REPO"
 [[ $PRNUM =~ ^[0-9]+$ ]] || die "pr must be a number, got: $PRNUM"
 [[ $BOT =~ ^[A-Za-z0-9._-]+$ ]] || die "bad --bot: $BOT"
-OWNER=${REPO%%/*}; NAME=${REPO##*/}
+
 
 # --------------------------------------------------------------- wait audit
 # Background watchers get reaped without a word: the harness only records
@@ -260,7 +262,7 @@ if [ "$WAIT" = 1 ]; then
   WLOG=${PR_STATE_LOG:-$HOME/.pr-state-wait.log}
   wlog() { printf '%s %-6s pid=%-7d ppid=%-7d %s#%s %s\n' \
     "$(date -Is)" "$1" "$$" "$PPID" "$REPO" "$PRNUM" "${2-}" >>"$WLOG" 2>/dev/null || :; }
-  trap 'wlog exit "rc=$? reparented=$([ "$PPID" = 1 ] && echo yes || echo no)"' EXIT
+  trap 'wlog exit "rc=$? reparented=$([ "$PPID" = 1 ] && echo yes || echo no) full=${FULLS:-0} cached=${CACHED:-0}"' EXIT
   # A killed watcher used to leave an empty task file and the caller guessing.
   # Say so on stdout instead, so the wake carries its own reason.
   wdie() {
@@ -282,14 +284,17 @@ epoch() { [ -n "${1:-}" ] && [ "$1" != null ] && date -d "$1" +%s 2>/dev/null ||
 
 # api <args...> — echoes combined output; caller checks rc and uses the output as ERRMSG.
 # (Do NOT bump failure counters in here: every call site is a $(…) subshell.)
-# `timeout 120` bounds a hung gh call so --wait can honor its deadline.
-api() { timeout 120 gh api "$@" 2>&1; }
+# ghx (gh-rl.sh) = `timeout 120 gh api` + rate-limit backoff bounded by GH_RL_MAX_WAIT,
+# which --wait sets to the time left before its deadline.
+. "$(dirname "${BASH_SOURCE[0]}")/gh-rl.sh"
+api() { ghx "$@" 2>&1; }
 
 # The operator account counts as the author side when classifying who spoke last.
-ME=$(gh api user --jq '.login' 2>/dev/null | tr '[:upper:]' '[:lower:]') || ME=''
+ME=''   # looked up in snapshot() until it succeeds; gh caches it for a day
 
 snapshot() {
   ERRMSG=''; local pr reviews reactions comments threads checks cdate
+  [ -n "$ME" ] || ME=$(ghx user --cache 24h --jq '.login' 2>/dev/null | tr '[:upper:]' '[:lower:]') || ME=''
   pr=$(api "repos/$REPO/pulls/$PRNUM") || { ERRMSG="pulls/$PRNUM: ${pr:0:200}"; return 1; }
   PR_OPEN=$(jq -r 'if .state=="open" then 1 else 0 end' <<<"$pr")
   HEAD_SHA=$(jq -r .head.sha <<<"$pr")
@@ -297,7 +302,7 @@ snapshot() {
   case "$(jq -r .mergeable_state <<<"$pr")" in
     dirty) MERGEABLE=CONFLICTING ;; unknown) MERGEABLE=UNKNOWN ;; *) MERGEABLE=MERGEABLE ;;
   esac
-  cdate=$(api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.committer.date') \
+  cdate=$(api "repos/$REPO/commits/$HEAD_SHA" --cache 24h --jq '.commit.committer.date') \
     || { ERRMSG="commits/${HEAD_SHA:0:7}: ${cdate:0:200}"; return 1; }
   HEAD_AT=$(epoch "$cdate")
   # HEAD_AT=0 would make every historical 👍 "fresh" -> false converged. Never proceed on it.
@@ -404,34 +409,14 @@ snapshot() {
   BODY_PENDING=0
   [ "$head_body" = 1 ] && [ "$LAST_REPLY_AT" -le "$REVIEWED_AT" ] && BODY_PENDING=1
 
-  threads=$(api graphql --paginate -f query='
-    query($owner:String!,$repo:String!,$number:Int!,$endCursor:String){
-      repository(owner:$owner,name:$repo){ pullRequest(number:$number){
-        reviewThreads(first:100, after:$endCursor){
-          pageInfo{ hasNextPage endCursor }
-          nodes{ isResolved path
-                 first: comments(first:1){ nodes{ body } }
-                 last:  comments(last:1){ nodes{ author{ login } } } }
-        }}}}' -F owner="$OWNER" -F repo="$NAME" -F number="$PRNUM" --jq '
-      '"$IGNORE_JSON"' as $ig
-      | .data.repository.pullRequest.reviewThreads.nodes[]
-      | (((.path // "") + " " + (.first.nodes[0].body // "")) | ascii_downcase) as $hay
-      | [ (.isResolved|tostring),
-          ((.last.nodes[0].author.login // "")|ascii_downcase|rtrimstr("[bot]")),
-          (any($ig[]; inside($hay))|tostring) ] | @tsv') \
-    || { ERRMSG="threads: ${threads:0:200}"; return 1; }
-  THREADS=$(grep -c . <<<"$threads")
-  local open; open=$(awk -F'\t' '$1=="false" && $3=="false"' <<<"$threads")
-  UNRESOLVED=$(grep -c . <<<"$open")
-  # Author-side last word = deliberately open ("leaving this open for a human") — not actionable.
-  ANSWERED_OPEN=$(awk -F'\t' -v a="$AUTHOR" -v m="$ME" '$2==a || (m!="" && $2==m)' <<<"$open" | grep -c .)
-  ACTIONABLE=$((UNRESOLVED - ANSWERED_OPEN))
-  UNANSWERED=$(awk -F'\t' -v b="$BOT" '$2==b' <<<"$open" | grep -c .)
-  IGNORED=$(awk -F'\t' '$1=="false" && $3=="true"' <<<"$threads" | grep -c .)
+  # GraphQL, or REST + the resolution cache when GraphQL is low/limited (gh-rl.sh threads_read).
+  threads_read "$REPO" "$PRNUM" 1 || { ERRMSG="threads: ${THREADS_JSON:0:200}"; return 1; }
+  count_threads
 
-  # gh pr checks exits 8 on pending and 1 on failing/none — read the JSON, not the code.
-  checks=$(gh pr checks "$PRNUM" --repo "$REPO" --json bucket 2>/dev/null)
-  jq -e . >/dev/null 2>&1 <<<"$checks" || checks='[]'
+  # `gh pr checks` (GraphQL), or its REST equivalent when GraphQL is low/limited. A rate
+  # limit used to read as "no checks" here, which could converge with CI unknown.
+  ci_checks "$REPO" "$PRNUM" "$HEAD_SHA" || { ERRMSG="checks: ${CI_JSON:0:200}"; return 1; }
+  checks=$CI_JSON
   # "cancel" is a terminal non-green bucket — a canceled required check must not converge.
   CI_FAIL=$(jq '[.[]|select(.bucket=="fail" or .bucket=="cancel")]|length' <<<"$checks")
   CI_PENDING=$(jq '[.[]|select(.bucket=="pending")]|length' <<<"$checks")
@@ -460,7 +445,41 @@ snapshot() {
 
   NOW=$(date +%s)
   decide
+  # REST can't see a bare "Unresolve" click, so a convergence read from REST threads is
+  # confirmed over GraphQL (one cheap query, even at the reserve) before it is reported.
+  if [ "$ACTION" = converged ] && [ "$THREADS_SRC" = rest ]; then
+    local low=${GQL_LOW:-0}; GQL_LOW=0
+    if threads_read "$REPO" "$PRNUM" 1 && [ "$THREADS_SRC" = graphql ]; then count_threads; decide
+    else hold_rest_converge; fi
+    GQL_LOW=$low
+  fi
   return 0
+}
+hold_rest_converge() {
+  [ "$ACTION" = converged ] && [ "$THREADS_SRC" = rest ] || return 0
+  ACTION=wait; REASON="converged per REST thread data; confirming over GraphQL once it has budget"
+}
+
+# Thread counts from THREADS_JSON (gh-rl.sh threads_read). Sets THREADS UNRESOLVED
+# ANSWERED_OPEN ACTIONABLE UNANSWERED IGNORED THREADS_UNCACHED.
+count_threads() {
+  local threads open
+  threads=$(jq -r --argjson ig "$IGNORE_JSON" '
+      (((.path // "") + " " + (.comments[0].body // "")) | ascii_downcase) as $hay
+      | [ (.resolved|tostring),
+          ((.last_by // "")|ascii_downcase|rtrimstr("[bot]")),
+          (any($ig[]; inside($hay))|tostring) ] | @tsv' <<<"$THREADS_JSON")
+  # On REST, threads missing from the cache count as unresolved: say how many.
+  THREADS_UNCACHED=0
+  [ "$THREADS_SRC" = rest ] && THREADS_UNCACHED=$(jq -s 'map(select(.id == null)) | length' <<<"$THREADS_JSON")
+  THREADS=$(grep -c . <<<"$threads")
+  open=$(awk -F'\t' '$1=="false" && $3=="false"' <<<"$threads")
+  UNRESOLVED=$(grep -c . <<<"$open")
+  # Author-side last word = deliberately open ("leaving this open for a human") — not actionable.
+  ANSWERED_OPEN=$(awk -F'\t' -v a="$AUTHOR" -v m="$ME" '$2==a || (m!="" && $2==m)' <<<"$open" | grep -c .)
+  ACTIONABLE=$((UNRESOLVED - ANSWERED_OPEN))
+  UNANSWERED=$(awk -F'\t' -v b="$BOT" '$2==b' <<<"$open" | grep -c .)
+  IGNORED=$(awk -F'\t' '$1=="false" && $3=="true"' <<<"$threads" | grep -c .)
 }
 
 emit() {
@@ -483,7 +502,9 @@ emit() {
     --argjson last_judged "${LAST_JUDGED:-0}" --argjson waived "${WAIVED:-false}" \
     --arg last_verdict "${LAST_VERDICT:-}" \
     --arg code_status "${CODE_STATUS:-}" --arg code_sha "${CODE_SHA:-}" --arg code_findings "${CODE_FINDINGS:-}" \
+    --arg ts "${THREADS_SRC:-}" --arg cs "${CI_SRC:-}" --argjson tu "${THREADS_UNCACHED:-0}" \
     '{repo:$repo, pr:$pr, action:$action, reason:$reason,
+      sources:{threads:$ts, ci:$cs}, threads_uncached:$tu,
       head:$head, head_reviewed:($reviewed==$head), reviewed:$reviewed, head_age_s:$head_age,
       unresolved:$unresolved, actionable:$actionable, answered_open:$answered_open,
       unanswered_by_bot:$unanswered, ignored_open:$ignored, threads_total:$threads,
@@ -503,8 +524,50 @@ emit() {
 
 deadline=$(( $(date +%s) + TIMEOUT ))
 prev='' FAILS=0
+# Measured snapshot cost: 7 REST + 2 GraphQL (threads, gh pr checks). The watcher's poll
+# interval stretches as the shared budget drains (gh-rl.sh rl_interval), and sets GQL_LOW
+# so snapshots move to REST once GraphQL is down to its reserve.
+SNAP_CORE=7 SNAP_GQL=2
+# ETag probe (watcher only): conditional GETs on everything decide() reads over REST. All
+# 304 (free) → nothing moved: re-run decide() on the last snapshot with a fresh clock, since
+# grace / retrigger / TTL windows are time-based. Any change, probe error, or a snapshot
+# older than FULL_EVERY → full snapshot. Thread resolution is GraphQL-only (no ETag); the
+# periodic full snapshot bounds how stale it can get. Comments are probed `since` the
+# watcher started, so edits on any page show (the Codex summary is edited in place).
+FULL_EVERY=${PR_STATE_FULL_EVERY:-300}
+[[ $FULL_EVERY =~ ^[0-9]{1,6}$ ]] || die "PR_STATE_FULL_EVERY must be an integer"
+SINCE=$(date -u -d "@$(( $(date +%s) - 120 ))" +%FT%TZ)
+probe_moved() { # → 0 if anything moved (or can't tell); probes every path so all ETags stay current
+  local p moved=1
+  for p in "repos/$REPO/pulls/$PRNUM" "repos/$REPO/pulls/$PRNUM/reviews?per_page=100" \
+           "repos/$REPO/issues/$PRNUM/reactions?per_page=100" \
+           "repos/$REPO/issues/$PRNUM/comments?per_page=100&since=$SINCE" \
+           "repos/$REPO/pulls/$PRNUM/comments?per_page=100&since=$SINCE" \
+           "repos/$REPO/commits/${HEAD_SHA:-none}/check-runs?per_page=100" \
+           "repos/$REPO/commits/${HEAD_SHA:-none}/status?per_page=100"; do
+    etag_changed "$p" && moved=0
+  done
+  return $moved
+}
+last_full=0 FULLS=0 CACHED=0
+if [ "$WAIT" = 1 ]; then
+  rl_interval "$INTERVAL" "$SNAP_CORE" "$SNAP_GQL"
+  GH_RL_DEADLINE=$deadline   # a rate limit inside a snapshot may be slept out, never past it
+  # Prime the ETags BEFORE the first snapshot, so nothing that moves in between is missed.
+  # HEAD's per-sha paths are unknown yet: the next probe sees them as new and takes one
+  # more snapshot, after which polls are free.
+  probe_moved || :
+fi
 while :; do
-  if snapshot; then
+  if [ "$WAIT" = 1 ] && [ "$last_full" -gt 0 ] && [ $(( $(date +%s) - last_full )) -lt "$FULL_EVERY" ] \
+     && ! probe_moved; then
+    NOW=$(date +%s); decide; hold_rest_converge; CACHED=$((CACHED+1)); got=1
+  elif snapshot; then
+    got=1 last_full=$(date +%s) FULLS=$((FULLS+1))
+  else
+    got=0 last_full=0
+  fi
+  if [ "$got" = 1 ]; then
     FAILS=0
     [ "$WAIT" = 0 ] && { emit; exit 0; }
     fp="$ACTION|$HEAD_SHA|$REVIEWED_SHA|$ACTIONABLE|$CI_FAIL|$MERGEABLE|$THUMBS_AT|$APPROVED_AT|$CLEAN_AT|$LIMIT_AT|$CODE_STATUS|$CODE_SHA"
@@ -512,7 +575,9 @@ while :; do
     if [ -n "$prev" ] && [ "$fp" != "$prev" ]; then emit; exit 0; fi
     prev=$fp
   else
-    FAILS=$((FAILS+1))
+    # A rate limit is not an API failure: the watcher waits it out (the interval below
+    # reaches the reset); only real errors count toward the 3-strikes stop.
+    [ "$(rl_kind "$ERRMSG")" = none ] && FAILS=$((FAILS+1))
     [ "$WAIT" = 0 ] && die "$ERRMSG"
     [ "$FAILS" -ge 3 ] && die "3 consecutive API failures: $ERRMSG"
   fi
@@ -520,6 +585,10 @@ while :; do
   [ "$left" -le 0 ] && {
     jq -nc --arg repo "$REPO" --argjson pr "$PRNUM" --argjson t "$TIMEOUT" \
       '{repo:$repo, pr:$pr, action:"timeout", reason:"no change in \($t)s"}'; exit 10; }
-  # never sleep past the deadline — --timeout is a wall-clock bound
-  if [ "$left" -lt "$INTERVAL" ]; then sleep "$left"; else sleep "$INTERVAL"; fi
+  rl_interval "$INTERVAL" "$SNAP_CORE" "$SNAP_GQL"
+  [ "$RL_INTERVAL" -gt $(( INTERVAL * 4 )) ] && wlog budget "interval=${RL_INTERVAL}s gql_low=$GQL_LOW"
+  # never sleep past the deadline — --timeout is a wall-clock bound. `& wait` keeps the
+  # TERM trap responsive during long budget sleeps.
+  [ "$left" -lt "$RL_INTERVAL" ] && RL_INTERVAL=$left
+  sleep "$RL_INTERVAL" & wait $!
 done
