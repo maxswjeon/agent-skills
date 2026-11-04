@@ -37,30 +37,7 @@ SUMMARY_H='## Review loop summary'
 WAIVE_H='## Known limitations (review waived)'
 FIXED_RE='(?<![Nn]ot )[Ff]ixed in[^0-9a-f]{0,4}([0-9a-f]{6,40})'
 
-usage() { cat <<'EOF'
-usage: bash pr-ops.sh <command> …      JSON on stdout; exit 1 on failure
-  resolve [<pr-url>|<pr>]              PR coordinates + whether this checkout may commit
-  feedback <repo> <n> [--ignore P]…    actionable threads, unanswered review bodies and
-                                       comments, failing checks with log tails
-  reply <repo> <n> < items.jsonl       one JSON object per line, applied one at a time:
-      {"thread":ID,"body":S}                 reply only (explain / defer)
-      {"thread":ID,"body":S,"resolve":true}  reply, then resolve; body must cite
-                                             "Fixed in <sha>" for a commit on the PR head
-      {"thread":ID,"resolve":true}           resolve only (finish a replied:true item)
-      {"review":ID,"body":S}                 top-level comment linking that review
-      add "root":N (from feedback) to let a thread reply fall back to REST
-  push <repo> <n>                      git push, then confirm the PR head is local HEAD
-  sync <repo> <n> [--loop] [--ignore P]…   oracle + trigger + labels; branch on .next
-  block|unblock <repo> <n>             red review-blocked label
-  reset <repo> <n> <what>              post the "Review train reset" marker
-  judge <repo> <n> <train_rounds> <VERDICT> <findings> <p1> <reason> [<issue#> <concern>]
-  issue <repo> <n> <train_rounds> <title> <body-file> [<thread-id>…]   find-or-create
-  post-summary <repo> <n> <file> [--ignore P]…   hide old summaries, post, re-sync
-  waive <repo> <n> <file>              create/update Known limitations, label waived
-  settle <repo> <n>                    wait for CI + a review of HEAD (≤ ~80 min; background)
-  --self-test
-EOF
-}
+usage() { cat "$HERE/pr-ops-usage.txt"; }
 
 die() { jq -nc --arg e "$1" '{ok:false,error:$e}'; exit 1; }
 need_pr() {

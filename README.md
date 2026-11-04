@@ -16,7 +16,7 @@ Clone into your skills directory, or symlink the skills you want:
 git clone https://github.com/maxswjeon/agent-skills ~/.claude/skills
 ```
 
-The PR skills need bash 4.4+, GNU date, `jq` and an authenticated `gh`. Their scripts have `--self-test`.
+The PR skills need bash 4.4+, GNU date, `jq`, `envsubst` (gettext) and an authenticated `gh`. Their scripts have `--self-test`.
 
 ## Adding a skill
 

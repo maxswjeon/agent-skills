@@ -173,45 +173,21 @@ if [ "${UNRESOLVED:-0}" = 1 ]; then
 fi
 SEVSTR="$P1 P1, $P2 P2"; [ "$P3" -gt 0 ] && SEVSTR="$SEVSTR, $P3 P3"
 
-cat <<EOF
-## Review loop summary
-
-**Goal** — <FILL: 1–3 sentences on what this PR set out to do; source: title + body below>
-
-**Journey** — $ROUNDS review rounds, $FINDINGS findings ($SEVSTR), $COMMITS fix commits;
-converged by $CONVERGED_BY.
-
-**Fixed**
-EOF
-jq -r '.fixed[] | "- \(.t) → `\(.sha)`"' "$D"
-jq -re '.fixed | length == 0' "$D" >/dev/null && echo "- none"
-
-cat <<'EOF'
-
-**Decisions (major drifts from the initial plan)**
-- <FILL: only MAJOR course changes forced during review — design pivots, scope
-  cuts/additions, approach reversals — each anchored to a thread or commit.
-  "none — landed as planned" is valid. Source material below.>
-
-**Left over (answered, deliberately left open)**
-EOF
-jq -r '.answered_open[] | "- \(.t) — \"\(.reply)\" (`\(.path)`)"' "$D"
-jq -r '.muted_open[] | "- \(.t) — muted by --leave-open (`\(.path)`)"' "$D"
-jq -re '(.answered_open|length) + (.muted_open|length) == 0' "$D" >/dev/null && echo "- none"
-
-cat <<EOF
-
-<!-- ══ SOURCE MATERIAL — for filling the FILL slots. DELETE this block before posting. ══
-PR: $URL
-Title: $TITLE
-
-Body:
-$BODY
-
-Resolved WITHOUT a fix SHA (rebuttals, silent resolves — judge whether any is a Decision):
-EOF
-jq -r 'if (.resolved_other | length) == 0 then "- none" else .resolved_other[] | "- \(.t) — \"\(.reply)\" (`\(.path)`)" end' "$D"
-echo ""
-echo "Unresolved threads with the REVIEWER side last (should be none at convergence):"
-jq -r 'if (.unanswered | length) == 0 then "- none" else .unanswered[] | "- \(.t) (`\(.path)`)" end' "$D"
-echo "══ END SOURCE MATERIAL ══ -->"
+# The lists, then review-summary.tmpl. An explicit variable list, so a literal $ in the
+# template stays; values are never re-expanded, so a $ in the PR body is safe too.
+command -v envsubst >/dev/null || die "envsubst not found (gettext)"
+FIXED=$(jq -r 'if (.fixed | length) == 0 then "- none" else .fixed[] | "- \(.t) → `\(.sha)`" end' "$D")
+LEFT_OVER=$(jq -r '(.answered_open[] | "- \(.t) — \"\(.reply)\" (`\(.path)`)"),
+  (.muted_open[] | "- \(.t) — muted by --leave-open (`\(.path)`)"),
+  (if (.answered_open | length) + (.muted_open | length) == 0 then "- none" else empty end)' "$D")
+RESOLVED_OTHER=$(jq -r 'if (.resolved_other | length) == 0 then "- none" else .resolved_other[] | "- \(.t) — \"\(.reply)\" (`\(.path)`)" end' "$D")
+UNANSWERED=$(jq -r 'if (.unanswered | length) == 0 then "- none" else .unanswered[] | "- \(.t) (`\(.path)`)" end' "$D")
+export ROUNDS FINDINGS SEVSTR COMMITS CONVERGED_BY FIXED LEFT_OVER URL TITLE RESOLVED_OTHER UNANSWERED
+# BODY stays out of the environment: GitHub allows 65,536 characters (~196 KB of Korean) and
+# Linux caps one environment string at 128 KiB. awk splices it in at the ${BODY} line.
+# shellcheck disable=SC2016  # envsubst takes the names literally
+envsubst '$ROUNDS $FINDINGS $SEVSTR $COMMITS $CONVERGED_BY $FIXED $LEFT_OVER $URL $TITLE $RESOLVED_OTHER $UNANSWERED' \
+  < "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/review-summary.tmpl" \
+  | awk 'NR == FNR { b = b $0 "\n"; next }
+         !done && prev == "Body:" && $0 == "${BODY}" { printf "%s", b; done = 1; next }
+         { print; prev = $0 }' <(printf '%s\n' "$BODY") -

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Offline stand-in for gh, used by `gh-rl.sh --self-test`. FAKE_MODE picks the failure:
+#   primary  a primary rate limit       page502  a 502 whose page text mentions "rate limit"
+[ "$1 $2" = "api rate_limit" ] && { printf '%s\n' "$FAKE_RL"; exit 0; }
+echo "$*" >>"$FAKE_LOG"
+case $FAKE_MODE in
+  primary) echo '{"message":"API rate limit exceeded"}'; echo 'gh: API rate limit exceeded for user ID 1. (HTTP 403)' >&2 ;;
+  page502) echo '{"body":"we should handle the rate limit here"}'; echo 'gh: HTTP 502: Bad Gateway' >&2 ;;
+esac
+exit 1

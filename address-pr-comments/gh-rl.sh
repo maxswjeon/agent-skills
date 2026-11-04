@@ -305,18 +305,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   e "old 3-column cache → unresolved"           "$(trs $'T\t7\ttrue' "$c1")" false
 
   # ghx against a fake gh (offline): what gets retried, how often, and for how long.
+  td=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/testdata
   fk=$(mktemp -d); trap 'rm -rf "$fk"' EXIT
-  cat >"$fk/gh" <<'FAKE'
-#!/usr/bin/env bash
-[ "$1 $2" = "api rate_limit" ] && { printf '%s\n' "$FAKE_RL"; exit 0; }
-echo "$*" >>"$FAKE_LOG"
-case $FAKE_MODE in
-  primary) echo '{"message":"API rate limit exceeded"}'; echo 'gh: API rate limit exceeded for user ID 1. (HTTP 403)' >&2 ;;
-  page502) echo '{"body":"we should handle the rate limit here"}'; echo 'gh: HTTP 502: Bad Gateway' >&2 ;;
-esac
-exit 1
-FAKE
-  chmod +x "$fk/gh"; export FAKE_LOG="$fk/log"; PATH="$fk:$PATH"
+  cp "$td/fake-gh" "$fk/gh" && chmod +x "$fk/gh"; export FAKE_LOG="$fk/log"; PATH="$fk:$PATH"
   calls() { grep -c . "$FAKE_LOG"; }; now=$(date +%s)
   : >"$FAKE_LOG"; export FAKE_MODE=page502
   GH_RL_MAX_WAIT=6 ghx --paginate repos/o/r/issues/1/comments >/dev/null 2>&1
