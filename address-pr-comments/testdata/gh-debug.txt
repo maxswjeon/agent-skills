@@ -1,0 +1,122 @@
+[git remote -v]
+* Request at 2026-11-04 06:53:58.934839309 +0000 UTC m=+0.041580997
+* Request to https://api.github.com/graphql
+> POST /graphql HTTP/1.1
+> Host: api.github.com
+> Authorization: token ████████████████████
+> Content-Type: application/json; charset=utf-8
+
+GraphQL query:
+query($owner:String!,$n:Int!){ repository(owner:$owner,name:"r"){ pullRequest(number:1){
+  reviewThreads(first:50){ nodes{ id tail: comments(last:$n){ nodes{ body } } } } } } }
+GraphQL variables: {"n":3,"owner":"o"}
+
+< HTTP/2.0 200 OK
+< X-Ratelimit-Limit: 5000
+< X-Ratelimit-Remaining: 4990
+< X-Ratelimit-Reset: 1793775418
+< X-Ratelimit-Resource: graphql
+< X-Ratelimit-Used: 10
+
+{
+  "data": {"body": "we hit the rate limit again"}
+}
+
+* Request took 475.631588ms
+* Request at 2026-11-04 06:53:59.100000000 +0000 UTC m=+0.2
+* Request to https://api.github.com/graphql
+> POST /graphql HTTP/1.1
+> Content-Type: application/json; charset=utf-8
+
+GraphQL query:
+mutation($t:ID!,$b:String!){ addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$t, body:$b}){ comment{ id } } }
+GraphQL variables: {"b":"SECRET-REPLY","t":"PRRT_1"}
+
+< HTTP/2.0 200 OK
+< X-Ratelimit-Remaining: 4989
+< X-Ratelimit-Reset: 1793775418
+< X-Ratelimit-Resource: graphql
+< X-Ratelimit-Used: 11
+
+{"data": {}}
+
+* Request took 300ms
+* Request at 2026-11-04 06:53:59.400000000 +0000 UTC m=+0.5
+* Request to https://api.github.com/repos/o/r/issues/1/comments
+> POST /repos/o/r/issues/1/comments HTTP/1.1
+
+{
+  "body": "SECRET-COMMENT"
+}
+
+< HTTP/2.0 201 Created
+< X-Ratelimit-Remaining: 4500
+< X-Ratelimit-Reset: 1793776942
+< X-Ratelimit-Resource: core
+< X-Ratelimit-Used: 500
+
+* Request took 250ms
+* Request at 2026-11-04 06:53:59.700000000 +0000 UTC m=+0.8
+* Request to https://api.github.com/repos/o/r/pulls/1?per_page=100
+> GET /repos/o/r/pulls/1?per_page=100 HTTP/1.1
+> If-None-Match: W/"abc"
+
+< HTTP/2.0 304 Not Modified
+< X-Ratelimit-Remaining: 4500
+< X-Ratelimit-Reset: 1793776942
+< X-Ratelimit-Resource: core
+< X-Ratelimit-Used: 500
+
+* Request took 120ms
+* Request at 2026-11-04 15:54:00.100000000 +0900 KST m=+1.0
+* Request to https://api.github.com/graphql
+> POST /graphql HTTP/1.1
+> X-Gh-Cache-Ttl: 24h0m0s
+
+{
+  "query": "query PullRequest_fields{CheckRun: __type(name: \"CheckRun\"){fields{name}}}"
+}
+
+< HTTP/2.0 200 OK
+* Request at 2026-11-04 15:54:00.100100000 +0900 KST m=+1.0
+* Request to https://api.github.com/graphql
+> POST /graphql HTTP/1.1
+> X-Gh-Cache-Ttl: 24h0m0s
+
+< Date: Tue, 03 Nov 2026 18:26:52 GMT
+< X-Ratelimit-Resource: graphql
+< X-Ratelimit-Used: 749
+{
+  "query": "query PullRequest_fields2{WorkflowRun: __type(name: \"WorkflowRun\"){fields{name}}}"
+}
+
+
+{"data": "first"}
+
+* Request took 614.09µs
+< HTTP/2.0 200 OK
+< Date: Tue, 03 Nov 2026 18:26:52 GMT
+
+{
+  "data": "the rate limit leaked"
+}
+
+* Request took 812.313µs
+* Request at 2026-11-04 06:54:01.000000000 +0000 UTC m=+2.0
+* Request to https://api.github.com/graphql
+> POST /graphql HTTP/1.1
+
+GraphQL query:
+fragment C on IssueComment { id url }
+
+mutation($s:ID!,$b:String!){ addComment(input:{subjectId:$s, body:$b}){ commentEdge{ node{ ...C } } } }
+GraphQL variables: {"b":"SECRET-FRAGMENT-BODY","s":"I_1"}
+
+< HTTP/2.0 200 OK
+< X-Ratelimit-Resource: graphql
+< X-Ratelimit-Reset: 1793775418
+< X-Ratelimit-Used: 12
+
+{"data": {}}
+
+* Request took 280ms

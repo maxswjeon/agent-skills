@@ -1,8 +1,11 @@
 # usage: python3 -I judge-features.py OWNER/REPO NUMBER [TRAIN_START_ISO]
 #   -> JSON of the review-train features at the latest 5-round checkpoint.
 #   TRAIN_START_ISO is the oracle's train_start; rounds before it belong to an earlier train.
-import json, re, subprocess, sys, collections
+import json, os, re, subprocess, sys, collections
 from datetime import datetime
+# gh through address-pr-comments/bin/gh, which files each request into the call log
+GH=os.path.join(os.path.dirname(os.path.realpath(__file__)),'..','address-pr-comments','bin','gh')
+GH=GH if os.access(GH,os.X_OK) else 'gh'
 repo,num=sys.argv[1],int(sys.argv[2]); o,n=repo.split('/')
 since=sys.argv[3] if len(sys.argv)>3 and sys.argv[3] not in ('','null') else None
 BOT='chatgpt-codex-connector'
@@ -15,7 +18,7 @@ QC='''query($o:String!,$n:String!,$num:Int!,$c:String){repository(owner:$o,name:
 def pages(q,key):
     out=[];c=None;pr=None
     while True:
-        a=['gh','api','graphql','-f',f'query={q}','-f',f'o={o}','-f',f'n={n}','-F',f'num={num}']+(['-f',f'c={c}'] if c else [])
+        a=[GH,'api','graphql','-f',f'query={q}','-f',f'o={o}','-f',f'n={n}','-F',f'num={num}']+(['-f',f'c={c}'] if c else [])
         pr=json.loads(subprocess.run(a,capture_output=True,text=True,check=True).stdout)['data']['repository']['pullRequest']
         out+=pr[key]['nodes']
         if not pr[key]['pageInfo']['hasNextPage']: return out,pr

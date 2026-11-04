@@ -12,6 +12,8 @@ judge agent rules on whether to go on.
 With `D="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"`: `$OPS` means
 `bash "$D/address-pr-comments/pr-ops.sh"` (`--help` lists every command) and `$WATCH` means
 `bash "$D/address-pr-comments/pr-state.sh"` (the oracle; `--wait` makes it the watcher).
+Any gh command you run yourself goes through `"$D/address-pr-comments/bin/gh"`, so the
+call log stays complete (address-pr-comments, Call log).
 Shell variables don't survive between Bash calls: write them out (or set them) in each call.
 
 **Never decide state yourself.** Reactions never expire, so "is there a 👍?" stays true

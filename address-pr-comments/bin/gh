@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# bin/gh — the real gh, with every HTTP request it makes filed into the call log
+# (gh-log.py; tables in gh-log.sql). gh-rl.sh puts this directory first on PATH, so every gh
+# the PR-review scripts run — ghx, `gh pr checks`, `gh run view`, rate_limit reads, ETag
+# probes — comes through here. Call it by path for a gh call made outside the scripts.
+#
+# How: the real gh runs with GH_DEBUG=api, which writes each HTTP exchange to stderr as a
+# block from "* Request at" to "* Request took". stdout passes through untouched; stderr is
+# given back without those blocks (or the "[git …]" lines debug mode adds), so callers that
+# classify gh's stderr (rl_kind) see exactly what plain gh prints.
+# PR_REVIEW_LOG=0, a GH_DEBUG of your own, or no python3: plain gh, nothing logged.
+
+real=''
+IFS=: read -ra _dirs <<<"$PATH"
+for _d in "${_dirs[@]}"; do
+  if [ -x "$_d/gh" ] && ! [ "$_d/gh" -ef "${BASH_SOURCE[0]}" ]; then real=$_d/gh; break; fi
+done
+[ -n "$real" ] || { echo "gh: no gh on PATH besides ${BASH_SOURCE[0]}" >&2; exit 127; }
+py=/usr/bin/python3; [ -x "$py" ] || py=$(command -v python3)   # skips pyenv's ~130 ms shim
+if [ "${PR_REVIEW_LOG:-1}" = 0 ] || [ -n "${GH_DEBUG:-}" ] || [ -z "$py" ]; then exec "$real" "$@"; fi
+ef=$(mktemp) || exec "$real" "$@"
+trap 'rm -f "$ef"' EXIT   # it holds request bodies; bash runs this even when `timeout` kills us
+
+t0=${EPOCHREALTIME:-$(date +%s.%N)}
+GH_DEBUG=api "$real" "$@" 2>"$ef"; rc=$?   # `timeout` signals its whole process group, gh included
+t1=${EPOCHREALTIME:-$(date +%s.%N)}
+
+# A depth, not a flag: concurrent requests (gh pr checks) overlap their blocks.
+awk '/^\* Request at /{d++} !d && !/^\[git .*\]$/ {print} /^\* Request took /{if (d) d--}' "$ef" >&2
+"$py" -I "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../gh-log.py" "$ef" "$rc" "$t0" "$t1" "$@" \
+  </dev/null >/dev/null 2>&1
+exit "$rc"

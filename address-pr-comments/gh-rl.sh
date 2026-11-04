@@ -23,12 +23,18 @@
 #      invisible to REST, so pr-state.sh confirms a REST-derived `converged` over GraphQL
 #      and reports `wait` when it can't.
 # PR_REVIEW_FORCE_REST=1 forces the REST paths (testing).
+#
+# Every gh here and in the scripts that source this runs through bin/gh, which files each
+# HTTP request (rate-limit headers, expected vs actual cost, query text, never a mutation's
+# body) into the SQLite call log; see gh-log.sql. PR_REVIEW_LOG=0 turns it off.
 
 for _v in GH_RL_MAX_WAIT GH_RL_DEADLINE PR_REVIEW_RESERVE_PCT; do   # they reach $((…))
   [ -z "${!_v:-}" ] || [[ ${!_v} =~ ^(0|[1-9][0-9]{0,9})$ ]] \
     || { jq -nc --arg e "$_v must be an integer" '{ok:false, action:"error", error:$e}'; exit 1; }
 done
 GH_RL_MAX_WAIT=${GH_RL_MAX_WAIT:-75}
+_gh_bin=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/bin
+case ":$PATH:" in *":$_gh_bin:"*) ;; *) export PATH="$_gh_bin:$PATH" ;; esac
 
 # rl_kind <gh stderr> → primary | secondary | none. Stderr only: stdout can hold page text.
 rl_kind() {
@@ -54,6 +60,8 @@ rl_status() {
 
 ghx() {
   local out err rc kind res=core delay=60 quick=1 w now rem reset ef a s end
+  for a in "${FUNCNAME[@]:1}"; do [ "$a" = api ] || break; done   # the call log's `caller`
+  local -x GH_LOG_CALLER=${GH_LOG_CALLER:-$a}
   for a in "$@"; do   # the bucket follows the endpoint, never a -f value that mentions one
     [ "$a" = graphql ] && res=graphql
     [[ $a == search/* ]] && res=search
@@ -270,6 +278,7 @@ threads_read() {
 
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   rc=0
+  export PR_REVIEW_LOG=0   # keep test traffic out of the real call log; bin/gh's test opts back in
   e() { if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1: got '$2', want '$3'"; rc=1; fi; }
   e "primary (REST)"     "$(rl_kind 'gh: API rate limit exceeded for user ID 1. (HTTP 403)')" primary
   e "primary (GraphQL)"  "$(rl_kind 'GraphQL: API rate limit already exceeded for user ID 1.')" primary
@@ -321,5 +330,32 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   e "ghx: reset past the deadline → fails at once" "$(( $(date +%s) - t0 <= 2 ))" 1
   err=$(GH_RL_MAX_WAIT=0 ghx -X POST repos/o/r/issues/1/comments -f body="mentions graphql here" 2>&1 >/dev/null)
   e "ghx: the bucket follows the endpoint, not a -f value" "${err:0:18}" "rate limited (core"
+
+  # bin/gh against the same fake (which bin/gh finds as the real gh behind it on PATH).
+  py=/usr/bin/python3; [ -x "$py" ] || py=python3
+  "$py" -I "$td/../gh-log.py" --self-test || rc=1
+  q() { "$py" -I -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1])
+print("\n".join(" ".join(map(str, r)) for r in c.execute(sys.argv[2])))' "$fk/calls.sqlite" "$1"; }
+  : >"$FAKE_LOG"; export FAKE_MODE=debug FAKE_DEBUG="$td/gh-debug.txt"
+  out=$(PR_REVIEW_LOG=1 PR_REVIEW_LOG_DB="$fk/calls.sqlite" "$_gh_bin/gh" api graphql -f body=SECRET-ARG \
+        2>"$fk/err" <<<piped); w=$?
+  e "bin/gh: stdin and stdout pass through"          "$out" $'piped\n{"ok":1}'
+  e "bin/gh: stderr is plain gh's (bodies say 'rate limit', blocks overlap)" "$(<"$fk/err")" "gh: HTTP 502: Bad Gateway"
+  e "bin/gh: gh's exit code"                          "$w" 1
+  e "log: a row per request; 304 and gh-cache free; GraphQL cost from the used step" \
+    "$(q "select intent, operation, expected_cost, coalesce(actual_cost, '-'), coalesce(cache, '-'),
+            coalesce(rl_used, '-') from calls order by id")" \
+    "query repository.pullRequest.reviewThreads 1 - - 10
+mutation addPullRequestReviewThreadReply 1 1 - 11
+mutation POST /repos/{owner}/{repo}/issues/{n}/comments 1 1 - 500
+query GET /repos/{owner}/{repo}/pulls/{n} 1 0 etag 500
+query PullRequest_fields 1 0 gh -
+query PullRequest_fields2 1 0 gh -
+mutation addComment 1 1 - 12"
+  e "log: query variables and query-string kept, as rows" \
+    "$(q "select name || '=' || value from request_params order by request_id, name" | tr '\n' ' ')" \
+    'n=3 owner="o" per_page=100 '
+  e "log: no mutation text anywhere (variables, bodies, argv)" \
+    "$("$py" -I -c 'import sqlite3,sys; print(sum("SECRET" in l for l in sqlite3.connect(sys.argv[1]).iterdump()))' "$fk/calls.sqlite")" 0
   exit $rc
 fi
