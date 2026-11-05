@@ -6,9 +6,10 @@
 #
 # Options:
 #   --wait                  poll until action != wait (or the state fingerprint moves)
-#   --interval N            base poll seconds (default 5). Each poll is an ETag probe (free
-#                           when nothing moved); a full snapshot runs only on a change or
-#                           every PR_STATE_FULL_EVERY s (300). The interval stretches as the
+#   --interval N            base poll seconds (default 5). Each poll is a cached conditional
+#                           probe (free when nothing moved); a change re-reads only what
+#                           moved, and a full snapshot runs every PR_STATE_FULL_EVERY s
+#                           (300). The interval stretches as the
 #                           shared rate-limit budget drains (gh-rl.sh rl_interval).
 #   --timeout N             give up waiting after N seconds (default 1800 = 30 min; the
 #                           caller re-checks and re-queues while the wait is legitimate —
@@ -262,7 +263,7 @@ if [ "$WAIT" = 1 ]; then
   WLOG=${PR_STATE_LOG:-$HOME/.pr-state-wait.log}
   wlog() { printf '%s %-6s pid=%-7d ppid=%-7d %s#%s %s\n' \
     "$(date -Is)" "$1" "$$" "$PPID" "$REPO" "$PRNUM" "${2-}" >>"$WLOG" 2>/dev/null || :; }
-  trap 'wlog exit "rc=$? reparented=$([ "$PPID" = 1 ] && echo yes || echo no) full=${FULLS:-0} cached=${CACHED:-0}"' EXIT
+  trap 'wlog exit "rc=$? reparented=$([ "$PPID" = 1 ] && echo yes || echo no) full=${FULLS:-0} partial=${PARTIALS:-0} cached=${CACHED:-0} memo=${CGET_MEMO:-0}"' EXIT
   # A killed watcher used to leave an empty task file and the caller guessing.
   # Say so on stdout instead, so the wake carries its own reason.
   wdie() {
@@ -283,21 +284,56 @@ IGNORE_JSON=$( [ ${#IGNORE[@]} -eq 0 ] && echo '[]' || printf '%s\n' "${IGNORE[@
 
 epoch() { [ -n "${1:-}" ] && [ "$1" != null ] && date -d "$1" +%s 2>/dev/null || echo 0; }
 
-# api <args...> — echoes combined output; caller checks rc and uses the output as ERRMSG.
-# (Do NOT bump failure counters in here: every call site is a $(…) subshell.)
-# ghx (gh-rl.sh) = `timeout 120 gh api` + rate-limit backoff bounded by GH_RL_DEADLINE:
-# ~90s for a snapshot, ≤75s per --wait iteration (longer waits are the loop's own sleep,
-# which a TERM can interrupt).
+# REST reads go through cget (gh-rl.sh): conditional GETs over an on-disk cache, inside
+# ghx's rate-limit backoff bounded by GH_RL_DEADLINE: ~90s for a snapshot, ≤75s per --wait
+# iteration (longer waits are the loop's own sleep, which a TERM can interrupt).
 . "$(dirname "${BASH_SOURCE[0]}")/gh-rl.sh"
-api() { ghx "$@" 2>&1; }
+
+# Filters the snapshot reads with and the watcher probes with — one cache entry each.
+# Reviews: body length is measured AFTER stripping the known Codex template — the raw body
+# is ~621 chars of boilerplate whether there are 0 or 19 findings.
+REVIEWS_JQ='.[] | [ (.user.login|ascii_downcase|rtrimstr("[bot]")),
+             (.user.login|test("\\[bot\\]$")|tostring),
+             .state, (.commit_id // ""), (.submitted_at // ""),
+             ( (.body // "")
+               | gsub("<details>[\\s\\S]*</details>"; "")
+               | gsub("<!--[\\s\\S]*?-->"; "")
+               | gsub("### 💡 Codex[^\n]*Review"; "")
+               | gsub("Here are some automated[^\n]*review suggestions for this pull request."; "")
+               | gsub("\\*\\*Reviewed commit:\\*\\*[^\n]*"; "")
+               | gsub("\\s"; "") | length ) ] | @tsv'
+REACTIONS_JQ='.[] | [.content, (.user.login|ascii_downcase|rtrimstr("[bot]")), (.user.login|test("\\[bot\\]$")|tostring), .created_at] | @tsv'
+# Issue comments. The sticky summary always names "Security Review" and the trigger
+# phrases, so its body is blanked for the phrase columns ($5-$7) and only feeds the state
+# JSON ($12, $13). Column meanings are documented where snapshot() reads them.
+bot_re=${BOT//./\\.}
+COMMENTS_JQ='def marker: (.body // "")|ascii_downcase
+       | if test("^(## |> \\*\\*)") then sub("^(## |> \\*\\*)"; "") else "" end;
+     def summary: (.body // "")|contains("<!-- codex-pull-request-review-summary -->");
+     def prose: if summary then "" else (.body // "")|ascii_downcase end;
+     .[] | [ ((.body // "")|ascii_downcase|test("^\\s*@('"$bot_re"'|codex)\\s+review\\b")|tostring),
+             (.user.login|test("\\[bot\\]$")|tostring),
+             (.user.login|ascii_downcase|rtrimstr("[bot]")),
+             .created_at,
+             (prose|test("codex review: didn.t find any major issues")|tostring),
+             (prose|(test("reached (your|its) codex usage limits") and (test("security review")|not))|tostring),
+             (prose|test("codex review: something went wrong")|tostring),
+             (marker|test("^(review (loop summary|train reset|train judge)|known limitations)")|tostring),
+             (marker|if startswith("review train reset") then "reset"
+                 elif startswith("review train judge") then "judge" else "-" end),
+             (marker|(capture("^review train judge . round (?<n>[0-9]+)").n) // "0"),
+             (marker|(capture("^review train judge . round [0-9]+: (?<v>[a-z]+)").v) // "-"),
+             (if summary then ((.body|capture("<!-- codex-review-state:v1 (?<j>\\{.*?\\}) -->").j) // "-") else "-" end),
+             (.updated_at // "") ] | @tsv'
 
 # The operator account counts as the author side when classifying who spoke last.
 ME=''   # looked up in snapshot() until it succeeds
 
 snapshot() {
   ERRMSG=''; local pr reviews reactions comments threads checks cdate
-  [ -n "$ME" ] || ME=$(ghx user --jq '.login' 2>/dev/null | tr '[:upper:]' '[:lower:]') || ME=''
-  pr=$(api "repos/$REPO/pulls/$PRNUM") || { ERRMSG="pulls/$PRNUM: ${pr:0:200}"; return 1; }
+  [ -n "$ME" ] || { cget user .login && ME=${CGET_BODY,,}; } || ME=''
+  cget "repos/$REPO/pulls/$PRNUM" || { ERRMSG="pulls/$PRNUM: ${CGET_ERR:0:200}"; return 1; }
+  pr=$CGET_BODY
   PR_OPEN=$(jq -r 'if .state=="open" then 1 else 0 end' <<<"$pr")
   HEAD_SHA=$(jq -r .head.sha <<<"$pr")
   AUTHOR=$(jq -r '.user.login|ascii_downcase|rtrimstr("[bot]")' <<<"$pr")
@@ -307,9 +343,9 @@ snapshot() {
   # A sha's commit date never changes: fetch it once per HEAD (not gh --cache, which also
   # stores error responses).
   if [ "$HEAD_SHA" != "${CDATE_SHA:-}" ]; then
-    cdate=$(api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.committer.date') \
-      || { ERRMSG="commits/${HEAD_SHA:0:7}: ${cdate:0:200}"; return 1; }
-    CDATE_SHA=$HEAD_SHA CDATE=$cdate
+    cget "repos/$REPO/commits/$HEAD_SHA" '.commit.committer.date' \
+      || { ERRMSG="commits/${HEAD_SHA:0:7}: ${CGET_ERR:0:200}"; return 1; }
+    CDATE_SHA=$HEAD_SHA CDATE=$CGET_BODY
   fi
   cdate=$CDATE
   HEAD_AT=$(epoch "$cdate")
@@ -317,20 +353,10 @@ snapshot() {
   [ "$HEAD_AT" -gt 0 ] || { ERRMSG="unparsable committer date: ${cdate:0:100}"; return 1; }
 
   # ALL reviews (paginated). Bot rows drive REVIEWED_*; non-bot rows drive human
-  # approval/CR. Body length is measured AFTER stripping the known Codex template —
-  # the raw body is ~621 chars of boilerplate whether there are 0 or 19 findings.
-  reviews=$(api --paginate "repos/$REPO/pulls/$PRNUM/reviews" --jq \
-    '.[] | [ (.user.login|ascii_downcase|rtrimstr("[bot]")),
-             (.user.login|test("\\[bot\\]$")|tostring),
-             .state, (.commit_id // ""), (.submitted_at // ""),
-             ( (.body // "")
-               | gsub("<details>[\\s\\S]*</details>"; "")
-               | gsub("<!--[\\s\\S]*?-->"; "")
-               | gsub("### 💡 Codex[^\n]*Review"; "")
-               | gsub("Here are some automated[^\n]*review suggestions for this pull request."; "")
-               | gsub("\\*\\*Reviewed commit:\\*\\*[^\n]*"; "")
-               | gsub("\\s"; "") | length ) ] | @tsv') \
-    || { ERRMSG="reviews: ${reviews:0:200}"; return 1; }
+  # approval/CR (REVIEWS_JQ, above).
+  cget_all "repos/$REPO/pulls/$PRNUM/reviews?per_page=100" "$REVIEWS_JQ" \
+    || { ERRMSG="reviews: ${CGET_ERR:0:200}"; return 1; }
+  reviews=$CGET_BODY
   local bot_rows last
   bot_rows=$(awk -F'\t' -v b="$BOT" '$1==b' <<<"$reviews")
   last=$(tail -n1 <<<"$bot_rows")
@@ -349,9 +375,9 @@ snapshot() {
   APPROVED_AT=0
   [ "$HUMAN_CR_AT" -eq 0 ] && APPROVED_AT=$(epoch "$(awk -F'\t' '$1=="APPROVED"{print $2}' <<<"$human_states" | sort | tail -n1)")
 
-  reactions=$(api --paginate "repos/$REPO/issues/$PRNUM/reactions" --jq \
-    '.[] | [.content, (.user.login|ascii_downcase|rtrimstr("[bot]")), (.user.login|test("\\[bot\\]$")|tostring), .created_at] | @tsv') \
-    || { ERRMSG="reactions: ${reactions:0:200}"; return 1; }
+  cget_all "repos/$REPO/issues/$PRNUM/reactions?per_page=100" "$REACTIONS_JQ" \
+    || { ERRMSG="reactions: ${CGET_ERR:0:200}"; return 1; }
+  reactions=$CGET_BODY
   # 👀 from anyone (a human looking is also a reason not to summon the bot) — but TTL'd in decide().
   EYES_AT=$(epoch "$(awk -F'\t' '$1=="eyes"{print $4}' <<<"$reactions" | sort | tail -n1)")
   # 👍 that converges: the review bot, or any non-bot account. Other [bot]s are noise.
@@ -363,30 +389,10 @@ snapshot() {
   # prose mention of "@codex review" (reports, quotes, the bot's own boilerplate) is not
   # a trigger. The clean "no major issues" reply is the bot's converge signal on manual
   # triggers. LAST_REPLY_AT is the AUTHOR side answering feedback — a reviewer's comment
-  # or a trigger must never count as an answer.
-  local bot_re=${BOT//./\\.}
-  # The sticky summary always names "Security Review" and the trigger phrases, so its body
-  # is blanked for the phrase columns ($5-$7) and only feeds the state JSON ($12, $13).
-  comments=$(api --paginate "repos/$REPO/issues/$PRNUM/comments" --jq \
-    'def marker: (.body // "")|ascii_downcase
-       | if test("^(## |> \\*\\*)") then sub("^(## |> \\*\\*)"; "") else "" end;
-     def summary: (.body // "")|contains("<!-- codex-pull-request-review-summary -->");
-     def prose: if summary then "" else (.body // "")|ascii_downcase end;
-     .[] | [ ((.body // "")|ascii_downcase|test("^\\s*@('"$bot_re"'|codex)\\s+review\\b")|tostring),
-             (.user.login|test("\\[bot\\]$")|tostring),
-             (.user.login|ascii_downcase|rtrimstr("[bot]")),
-             .created_at,
-             (prose|test("codex review: didn.t find any major issues")|tostring),
-             (prose|(test("reached (your|its) codex usage limits") and (test("security review")|not))|tostring),
-             (prose|test("codex review: something went wrong")|tostring),
-             (marker|test("^(review (loop summary|train reset|train judge)|known limitations)")|tostring),
-             (marker|if startswith("review train reset") then "reset"
-                 elif startswith("review train judge") then "judge" else "-" end),
-             (marker|(capture("^review train judge . round (?<n>[0-9]+)").n) // "0"),
-             (marker|(capture("^review train judge . round [0-9]+: (?<v>[a-z]+)").v) // "-"),
-             (if summary then ((.body|capture("<!-- codex-review-state:v1 (?<j>\\{.*?\\}) -->").j) // "-") else "-" end),
-             (.updated_at // "") ] | @tsv') \
-    || { ERRMSG="comments: ${comments:0:200}"; return 1; }
+  # or a trigger must never count as an answer (COMMENTS_JQ, above).
+  cget_all "repos/$REPO/issues/$PRNUM/comments?per_page=100" "$COMMENTS_JQ" \
+    || { ERRMSG="comments: ${CGET_ERR:0:200}"; return 1; }
+  comments=$CGET_BODY
   TRIGGER_AT=$(epoch "$(awk -F'\t' '$1=="true" && $2=="false"{print $4}' <<<"$comments" | sort | tail -n1)")
   TRIGGER_COUNT=$(awk -F'\t' '$1=="true" && $2=="false"' <<<"$comments" | grep -c .)
   # Unanswered requests on this HEAD: a completed review answers every request before it,
@@ -418,12 +424,22 @@ snapshot() {
   [ "$head_body" = 1 ] && [ "$LAST_REPLY_AT" -le "$REVIEWED_AT" ] && BODY_PENDING=1
 
   # GraphQL, or REST + the resolution cache when GraphQL is low/limited (gh-rl.sh threads_read).
-  threads_read "$REPO" "$PRNUM" 1 || { ERRMSG="threads: ${THREADS_JSON:0:200}"; return 1; }
+  # A watcher's partial snapshot (SNAP_REUSE=1) keeps the last read when the probe saw no
+  # review-comment change; resolve clicks wait for the periodic full one, as before.
+  if [ "${SNAP_REUSE:-0}" = 1 ] && [ "${DIRTY_THREADS:-1}" = 0 ] && [ -n "${THREADS_SRC:-}" ]; then :
+  else
+    threads_read "$REPO" "$PRNUM" 1 || { ERRMSG="threads: ${THREADS_JSON:0:200}"; return 1; }
+  fi
   count_threads
 
   # `gh pr checks` (GraphQL), or its REST equivalent when GraphQL is low/limited. A rate
-  # limit used to read as "no checks" here, which could converge with CI unknown.
-  ci_checks "$REPO" "$PRNUM" "$HEAD_SHA" || { ERRMSG="checks: ${CI_JSON:0:200}"; return 1; }
+  # limit used to read as "no checks" here, which could converge with CI unknown. Kept
+  # across a partial snapshot unless check runs or statuses moved, or HEAD did.
+  if [ "${SNAP_REUSE:-0}" = 1 ] && [ "${DIRTY_CI:-1}" = 0 ] && [ "${CI_SHA:-}" = "$HEAD_SHA" ]; then :
+  else
+    ci_checks "$REPO" "$PRNUM" "$HEAD_SHA" || { ERRMSG="checks: ${CI_JSON:0:200}"; return 1; }
+    CI_SHA=$HEAD_SHA
+  fi
   checks=$CI_JSON
   # "cancel" is a terminal non-green bucket — a canceled required check must not converge.
   CI_FAIL=$(jq '[.[]|select(.bucket=="fail" or .bucket=="cancel")]|length' <<<"$checks")
@@ -533,48 +549,65 @@ emit() {
 
 deadline=$(( $(date +%s) + TIMEOUT ))
 prev='' FAILS=0
-# Measured snapshot cost: 7 REST + 2 GraphQL (threads, gh pr checks). The watcher's poll
+# Snapshot cost before cget: 7 REST + 2 GraphQL (threads, gh pr checks). Its REST reads are
+# now 304s (free) unless something moved, so SNAP_CORE is an upper bound. The watcher's poll
 # interval stretches as the shared budget drains (gh-rl.sh rl_interval), and sets GQL_LOW
 # so snapshots move to REST once GraphQL is down to its reserve.
 SNAP_CORE=7 SNAP_GQL=2
-# ETag probe (watcher only): conditional GETs on everything decide() reads over REST. All
-# 304 (free) → nothing moved: re-run decide() on the last snapshot with a fresh clock, since
-# grace / retrigger / TTL windows are time-based. Any change, probe error, or a snapshot
-# older than FULL_EVERY → full snapshot. Seen only by that periodic snapshot (so at most
-# FULL_EVERY + one interval late): resolve/unresolve clicks (GraphQL-only, no ETag),
-# deleted comments from before SINCE, and items past page 1 of reviews or reactions
-# (though pulls/N's updated_at usually moves with a new review). Comments are probed `since` the
-# watcher started, so edits on any page show (the Codex summary is edited in place).
+# Probe (watcher only): cget every REST URL the snapshot reads, every page, with the
+# snapshot's own filters — plus review comments and CI for the GraphQL parts. All 304
+# (free) → nothing moved: re-run decide() on the last snapshot with a fresh clock, since
+# grace / retrigger / TTL windows are time-based. Something moved → a partial snapshot: its
+# REST reads come from this round's cache (no second request), and the two GraphQL reads
+# run only if their probes moved (threads: review comments; CI: check runs or statuses, or
+# a new HEAD). A probe error counts as everything moved. A full snapshot (both GraphQL
+# reads) still runs every FULL_EVERY: resolve/unresolve clicks are GraphQL-only, so they
+# show at most FULL_EVERY + one interval late. Deletions and edits on any page do show,
+# since a 304 is checked against the very bytes the snapshot used.
 FULL_EVERY=${PR_STATE_FULL_EVERY:-300}
 [[ $FULL_EVERY =~ ^[0-9]{1,6}$ ]] || die "PR_STATE_FULL_EVERY must be an integer"
-SINCE=$(date -u -d "@$(( $(date +%s) - 120 ))" +%FT%TZ)
-probe_moved() { # → 0 if anything moved (or can't tell); probes every path so all ETags stay current
+probe_moved() { # → 0 if anything moved (or can't tell); sets DIRTY_THREADS / DIRTY_CI
   local p moved=1
-  for p in "repos/$REPO/pulls/$PRNUM" "repos/$REPO/pulls/$PRNUM/reviews?per_page=100" \
-           "repos/$REPO/issues/$PRNUM/reactions?per_page=100" \
-           "repos/$REPO/issues/$PRNUM/comments?per_page=100&since=$SINCE" \
-           "repos/$REPO/pulls/$PRNUM/comments?per_page=100&since=$SINCE" \
-           "repos/$REPO/commits/${HEAD_SHA:-none}/check-runs?per_page=100" \
-           "repos/$REPO/commits/${HEAD_SHA:-none}/status?per_page=100"; do
-    etag_changed "$p" && moved=0
+  DIRTY_THREADS=0 DIRTY_CI=0
+  for p in pr reviews reactions comments threads runs status; do
+    CGET_CHANGED=0
+    case $p in
+      pr)        cget "repos/$REPO/pulls/$PRNUM" ;;
+      reviews)   cget_all "repos/$REPO/pulls/$PRNUM/reviews?per_page=100" "$REVIEWS_JQ" ;;
+      reactions) cget_all "repos/$REPO/issues/$PRNUM/reactions?per_page=100" "$REACTIONS_JQ" ;;
+      comments)  cget_all "repos/$REPO/issues/$PRNUM/comments?per_page=100" "$COMMENTS_JQ" ;;
+      threads)   cget_all "repos/$REPO/pulls/$PRNUM/comments?per_page=100" "$THREADS_REST_JQ" ;;
+      runs)      cget_all "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" "$CI_RUNS_JQ" ;;
+      status)    cget_all "repos/$REPO/commits/$HEAD_SHA/status?per_page=100" "$CI_STATUS_JQ" ;;
+    esac || CGET_CHANGED=1                         # can't tell: assume it moved
+    [ "$CGET_CHANGED" = 1 ] || continue
+    moved=0
+    case $p in threads) DIRTY_THREADS=1 ;; runs|status) DIRTY_CI=1 ;; esac
   done
   return $moved
 }
-last_full=0 FULLS=0 CACHED=0
+last_full=0 FULLS=0 PARTIALS=0 CACHED=0 SNAP_REUSE=0
 # Polls are mostly free 304s, so the budget-aware interval charges a snapshot's cost
-# amortized over FULL_EVERY. The first probe has no ETags yet and so always takes the second
-# snapshot itself: everything that moved after the first one is caught there.
+# amortized over FULL_EVERY. The cache is on disk, so even the first probe of a new watcher
+# compares against the bytes its first snapshot read.
 POLL_CORE=$(( SNAP_CORE * INTERVAL / FULL_EVERY + 1 )) POLL_GQL=$(( SNAP_GQL * INTERVAL / FULL_EVERY + 1 ))
 if [ "$WAIT" = 1 ]; then rl_interval "$INTERVAL" "$POLL_CORE" "$POLL_GQL"
 else export GH_RL_DEADLINE=${GH_RL_DEADLINE:-$(( $(date +%s) + 90 ))}   # foreground snapshot
 fi
 while :; do
+  # shellcheck disable=SC2034  # read by cget (gh-rl.sh)
+  CGET_ROUND=()   # a new round: every read is conditional again
   if [ "$WAIT" = 1 ]; then   # ghx may sleep out a limit for ≤75s; longer waits are ours, below
     GH_RL_DEADLINE=$(( $(date +%s) + 75 )); [ "$GH_RL_DEADLINE" -gt "$deadline" ] && GH_RL_DEADLINE=$deadline
   fi
-  if [ "$WAIT" = 1 ] && [ "$last_full" -gt 0 ] && [ $(( $(date +%s) - last_full )) -lt "$FULL_EVERY" ] \
-     && ! probe_moved; then
-    NOW=$(date +%s); decide; hold_rest_converge; CACHED=$((CACHED+1)); got=1
+  if [ "$WAIT" = 1 ] && [ "$last_full" -gt 0 ] && [ $(( $(date +%s) - last_full )) -lt "$FULL_EVERY" ]; then
+    if ! probe_moved; then
+      NOW=$(date +%s); decide; hold_rest_converge; CACHED=$((CACHED+1)); got=1
+    else              # partial: last_full stays, so the periodic full snapshot still comes
+      SNAP_REUSE=1
+      if snapshot; then got=1 PARTIALS=$((PARTIALS+1)); else got=0 last_full=0; fi
+      SNAP_REUSE=0
+    fi
   elif snapshot; then
     got=1 last_full=$(date +%s) FULLS=$((FULLS+1))
   else

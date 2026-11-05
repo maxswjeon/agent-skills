@@ -12,6 +12,8 @@ judge agent rules on whether to go on.
 With `D="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"`: `$OPS` means
 `bash "$D/address-pr-comments/pr-ops.sh"` (`--help` lists every command) and `$WATCH` means
 `bash "$D/address-pr-comments/pr-state.sh"` (the oracle; `--wait` makes it the watcher).
+Any gh command you run yourself goes through `"$D/address-pr-comments/bin/gh"`, so the
+call log stays complete (address-pr-comments, Call log).
 Shell variables don't survive between Bash calls: write them out (or set them) in each call.
 
 **Never decide state yourself.** Reactions never expire, so "is there a 👍?" stays true
@@ -66,7 +68,7 @@ $WATCH <repo> <n> --wait --timeout 1800 [--interval N] [--ignore …]   # run_in
 ```
 
 It exits when there's something to do or the state moved, and its stdout is the oracle
-JSON. Polls are ETag probes, free while the PR is quiet (plus a full snapshot every 5 min); its interval stretches
+JSON. Polls are cached conditional reads, free while the PR is quiet; a change re-reads only what moved (plus a full snapshot every 5 min); its interval stretches
 as the shared GitHub budget drains, and it waits out rate limits instead of failing. On a `timeout` (exit 10), `killed` (exit 143) or `wait`
 wake, go to step 2; still `wait` → relaunch. These re-queues are not iterations. One
 watcher at a time (check your background tasks first); never add Monitor, ScheduleWakeup

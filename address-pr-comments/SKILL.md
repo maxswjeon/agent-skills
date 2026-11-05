@@ -11,6 +11,8 @@ what was fixed. `pr-ops.sh` does every mechanical step and reads state through t
 for this — every hand-rolled copy has drifted from the oracle.
 
 `$OPS` below means `bash "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/address-pr-comments/pr-ops.sh"`.
+`$GH` means `"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/address-pr-comments/bin/gh"`: gh
+itself, with the call logged (see Call log). Use it for any gh command you run yourself.
 Shell variables don't survive between Bash calls: write it out (or set it) in each call.
 `$OPS --help` lists every command.
 
@@ -43,7 +45,7 @@ Shell variables don't survive between Bash calls: write it out (or set it) in ea
 
    A failing or canceled check is a Fix item: find the cause in `log_tail` and fix it, don't
    just re-run. Canceled because a newer run superseded it → wait for that run; otherwise
-   `gh run rerun <runId>`, and a second cancel is a failure to diagnose.
+   `$GH run rerun <runId>`, and a second cancel is a failure to diagnose.
 5. **Fix.** Read the cited code at HEAD (comment line numbers are from older commits). Make
    the surgical change — nothing beyond what was asked. A shared root cause gets one fix,
    and the commit body and every reply name all the threads it closes. Run the project's
@@ -87,6 +89,21 @@ exhausted, thread reads fall back to REST (`sources.threads: "rest"`); there, a 
 with `id: null` wasn't seen before, so it may already be resolved — reply with
 `{"root":N,"body":…}` and never resolve it. A foreground command that would have to wait
 more than ~90 s fails instead and names the reset time.
+
+The oracle's REST reads are conditional GETs over `${XDG_CACHE_HOME:-~/.cache}/pr-review/http`:
+what hasn't changed since any earlier read, in any process, comes back as a free 304. The
+watcher probes the same URLs, so a quiet PR costs nothing, and when something moves it
+re-reads only that: threads only if review comments moved, CI only if checks or HEAD did.
+Resolve/unresolve clicks are invisible to REST and show at the 5-minute full snapshot.
+
+## Call log
+
+Every GitHub request these scripts (and `$GH`) make lands in SQLite at
+`${XDG_STATE_HOME:-~/.local/state}/pr-review/gh-calls.sqlite` (`PR_REVIEW_LOG_DB` overrides,
+`PR_REVIEW_LOG=0` disables): rate limit remaining, expected and actual cost, whether it was
+a free 304, the calling script and function, and the query text with its variables as rows.
+Mutations keep only method, path and operation name. Query the `calls` view; the columns
+are explained in `gh-log.sql`. Logging failures go to `<db>.errors` and never fail the call.
 
 ## Notes
 
