@@ -147,24 +147,26 @@ rl_interval() {
 rest_preferred() { [ "${GQL_LOW:-0}" = 1 ] || [ "${PR_REVIEW_FORCE_REST:-}" = 1 ]; }
 
 # cget <path|url> [jq] → CGET_BODY (gh's --jq output, or the body) and CGET_NEXT (the
-# Link rel="next" URL); sets CGET_CHANGED=1 when GitHub sent fresh content (callers reset
-# it); returns 1 with gh's stderr in CGET_ERR. Call directly, not in $(…), where
-# CGET_CHANGED or the round memo matter.
+# Link rel="next" URL); sets CGET_CHANGED=1 when the content differs from what THIS process
+# last read for that key (callers reset it); returns 1 with gh's stderr in CGET_ERR. Call
+# directly, not in $(…), where CGET_CHANGED or the round memo matter.
 # Each response is kept on disk with its ETag, keyed by URL + filter, so the next read — in
 # this process or a later one — is a conditional GET: a 304 costs no rate limit and serves
-# the stored output, which is consistent with the server by construction (no ABA). Inside
-# one round (CGET_ROUND, reset by the caller) a key already read is served from disk with
-# no request at all; CGET_MEMO counts those. The filter still runs in gh (gojq), exactly
-# as `--paginate --jq` did. ponytail: no eviction — entries are a few KB per PR page.
+# the stored output. The disk cache is shared, so another process may have refreshed an
+# entry since this one last read it: a 304 then still hands out content this process hasn't
+# seen. "Changed" therefore compares ETags against CGET_SEEN (per process), never the 304.
+# Inside one round (CGET_ROUND, reset by the caller) a key already read is served from disk
+# with no request at all; CGET_MEMO counts those. The filter still runs in gh (gojq),
+# exactly as `--paginate --jq` did. ponytail: no eviction — entries are a few KB per page.
 CGET_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/pr-review/http
-declare -gA CGET_ROUND=()
+declare -gA CGET_ROUND=() CGET_SEEN=()
 CGET_CHANGED=0 CGET_MEMO=0
 cget() {
   local url=$1 jq=${2:-} key f et='' out rc ef hdr st args=(-i)
   key=$(printf '%s\0%s' "$url" "$jq" | sha1sum); key=${key%% *}; f=$CGET_DIR/$key
   if [ -n "${CGET_ROUND[$key]:-}" ] && [ -f "$f" ]; then
-    { IFS= read -r _; IFS= read -r CGET_NEXT; CGET_BODY=$(cat); } <"$f"
-    CGET_MEMO=$((CGET_MEMO + 1)); return 0
+    { IFS= read -r et; IFS= read -r CGET_NEXT; CGET_BODY=$(cat); } <"$f"
+    CGET_MEMO=$((CGET_MEMO + 1)); cget_seen "$key" "$et"; return 0
   fi
   [ -f "$f" ] && IFS= read -r et <"$f"
   [ -n "$et" ] && args+=(-H "If-None-Match: $et")   # never an empty one
@@ -178,11 +180,10 @@ cget() {
   else hdr=$out CGET_BODY=''; fi
   hdr=${hdr//$'\r'/}; st=${hdr%%$'\n'*}; st=${st#* }; st=${st%% *}
   if [ "$st" = 304 ] && [ -f "$f" ]; then            # gh exits 1 on a 304: the status decides
-    { IFS= read -r _; IFS= read -r CGET_NEXT; CGET_BODY=$(cat); } <"$f"
+    { IFS= read -r et; IFS= read -r CGET_NEXT; CGET_BODY=$(cat); } <"$f"   # one read: a matching pair
   elif [ "$st" = 200 ] && [ "$rc" = 0 ]; then         # 200 with rc≠0 is a --jq error, not data
     et=$(grep -i -m1 '^etag:' <<<"$hdr"); et=${et#*: }
     CGET_NEXT=$(grep -i -m1 '^link:' <<<"$hdr" | grep -o '<[^>]*>; rel="next"'); CGET_NEXT=${CGET_NEXT#<}; CGET_NEXT=${CGET_NEXT%%>*}
-    CGET_CHANGED=1
     if [ -n "$et" ]; then
       # shellcheck disable=SC2174  # only the cache dir itself needs 700
       mkdir -p -m 700 "$CGET_DIR" && printf '%s\n%s\n%s' "$et" "$CGET_NEXT" "$CGET_BODY" >"$f.$$" && mv -f "$f.$$" "$f"
@@ -191,7 +192,13 @@ cget() {
     [ -n "$CGET_ERR" ] || CGET_ERR="HTTP ${st:-?}: ${out:0:200}"
     return 1
   fi
+  cget_seen "$key" "$et"
   CGET_ROUND[$key]=1
+}
+# cget_seen <key> <etag>: record what this process just handed out; no ETag can't be compared.
+cget_seen() {
+  [ -n "$2" ] && [ "${CGET_SEEN[$1]-}" = "$2" ] || CGET_CHANGED=1
+  CGET_SEEN[$1]=$2
 }
 
 # cget_all <path> [jq] → CGET_BODY holds every page's output, following Link rel="next";
@@ -395,6 +402,18 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   e "cget: another filter is another entry"          "$CGET_BODY|$(calls)" "data-p1-G|1"
   export FAKE_VER=2; CGET_ROUND=(); CGET_CHANGED=0; cget p1 F; unset FAKE_VER
   e "cget: a new ETag → fresh read, marked changed"  "$CGET_BODY|$CGET_CHANGED" "data-p1-F|1"
+  # Another process refreshes the shared entry (v3) after this one read v2: this process's
+  # next probe gets a 304 on v3's ETag, yet v3 is news to it.
+  export FAKE_VER=3; ( CGET_ROUND=(); cget p1 F )
+  CGET_ROUND=(); CGET_CHANGED=0; : >"$FAKE_LOG"; cget p1 F
+  e "cget: a 304 on another process's refresh still counts as changed here" \
+    "$CGET_CHANGED|$(grep -c 'If-None-Match: W/"e-p1-3"' "$FAKE_LOG")" "1|1"
+  CGET_ROUND=(); CGET_CHANGED=0; cget p1 F
+  e "cget: ...and only once"                         "$CGET_CHANGED" 0
+  # Another process caches v4, then the server goes back to v3 — what this process last read.
+  ( export FAKE_VER=4; CGET_ROUND=(); cget p1 F )
+  CGET_ROUND=(); CGET_CHANGED=0; cget p1 F; unset FAKE_VER
+  e "cget: a 200 back to the content this process read is not a change" "$CGET_CHANGED" 0
   export FAKE_NOETAG=1; CGET_ROUND=(); : >"$FAKE_LOG"; cget q F; cget q F; unset FAKE_NOETAG
   e "cget: no ETag → nothing kept, never an empty If-None-Match" "$(calls)|$(grep -c If-None-Match "$FAKE_LOG")" "2|0"
   cget fail F; w=$?
