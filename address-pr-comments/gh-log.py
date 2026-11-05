@@ -253,9 +253,11 @@ def gh_cache_hit(r):
     """gh replays cached responses without a network call (its own feature checks, tagged
     X-Gh-Cache-Ttl; `gh api --cache`, untagged but answered in well under the 20 ms no round
     trip to GitHub makes). A replay keeps the original Date; 30 s of slack absorbs clock skew —
-    a cache entry that young is the only miss, and it costs nothing."""
-    if 'date' not in r['headers']: return False
-    if 'x-gh-cache-ttl' not in r['req_headers'] and not (r['took_ms'] or 1e9) < 20: return False
+    a cache entry that young is the only miss, and it costs nothing. A fast reply with no Date
+    at all is a replay too: two overlapping replays can leave both header sets on one of them."""
+    fast = (r['took_ms'] or 1e9) < 20
+    if 'date' not in r['headers']: return fast
+    if 'x-gh-cache-ttl' not in r['req_headers'] and not fast: return False
     try:
         sent = datetime.fromisoformat(iso(r['at']).replace('Z', '+00:00'))
         return (sent - email.utils.parsedate_to_datetime(r['headers']['date'])).total_seconds() > 30
@@ -388,6 +390,10 @@ def self_test():
       gh_cache_hit({**old, 'at': '2026-11-04 17:24:08.7 +0900 KST', 'req_headers': {}, 'took_ms': 0.8}), True)
     e('gh cache: a slow untagged reply with an old Date is not (clock skew)',
       gh_cache_hit({**old, 'at': '2026-11-04 17:24:08.7 +0900 KST', 'req_headers': {}, 'took_ms': 300}), False)
+    e('gh cache: a sub-ms reply whose headers went to its overlapping sibling is',
+      gh_cache_hit({**old, 'headers': {}, 'req_headers': {'x-gh-cache-ttl': '24h'}, 'took_ms': 0.4}), True)
+    e('gh cache: a slow reply without headers is not',
+      gh_cache_hit({**old, 'headers': {}, 'req_headers': {'x-gh-cache-ttl': '24h'}, 'took_ms': 500}), False)
     e('duration units', [duration_ms('475.5ms'), duration_ms('531.781µs'), duration_ms('1m2s')], [475.5, 0.532, 62000.0])
     e('repo/pr from a script command', repo_pr(['sync', 'o/r', '12', '--loop'], [], []), ('o/r', 12))
     e('repo/pr from a PR URL', repo_pr(['resolve', 'https://github.com/o/r/pull/7'], [], []), ('o/r', 7))
