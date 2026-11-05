@@ -3,11 +3,28 @@
 #   primary  a primary rate limit       page502  a 502 whose page text mentions "rate limit"
 #   debug    a 502 after the HTTP exchanges in $FAKE_DEBUG, written to stderr only under
 #            GH_DEBUG=api — what bin/gh has to strip back down to plain gh's stderr
+#   http     `gh api -i` for cget: CRLF headers, an ETag per URL (none with FAKE_NOETAG),
+#            p1 links to page p2, If-None-Match on the current ETag → 304; URL "fail" → 500.
+#            The body is data-<page>-<filter>, so entries per filter can be told apart.
 [ "$1 $2" = "api rate_limit" ] && { printf '%s\n' "$FAKE_RL"; exit 0; }
 echo "$*" >>"$FAKE_LOG"
 case $FAKE_MODE in
   primary) echo '{"message":"API rate limit exceeded"}'; echo 'gh: API rate limit exceeded for user ID 1. (HTTP 403)' >&2 ;;
   page502) echo '{"body":"we should handle the rate limit here"}'; echo 'gh: HTTP 502: Bad Gateway' >&2 ;;
   debug) cat; echo '{"ok":1}'; [ "${GH_DEBUG:-}" = api ] && cat "$FAKE_DEBUG" >&2; echo 'gh: HTTP 502: Bad Gateway' >&2 ;;
+  http)
+    inm='' url='' jq=''
+    shift   # api
+    while [ $# -gt 0 ]; do
+      case $1 in -i) ;; -H) inm=${2#If-None-Match: }; shift ;; --jq) jq=$2; shift ;; *) url=$1 ;; esac; shift
+    done
+    [ "$url" = fail ] && { echo 'gh: Server Error (HTTP 500)' >&2; exit 1; }
+    page=${url##*/} et="W/\"e-${url##*/}-${FAKE_VER:-1}\""; [ -n "${FAKE_NOETAG:-}" ] && et=''
+    if [ -n "$et" ] && [ "$inm" = "$et" ]; then
+      printf 'HTTP/2.0 304 Not Modified\r\nEtag: %s\r\n\r\n' "${et#W/}"; echo 'unexpected end of JSON input' >&2; exit 1
+    fi
+    printf 'HTTP/2.0 200 OK\r\n'; [ -n "$et" ] && printf 'Etag: %s\r\n' "$et"
+    [ "$page" = p1 ] && printf 'Link: <https://api.github.com/p2>; rel="next", <https://api.github.com/p2>; rel="last"\r\n'
+    printf '\r\ndata-%s-%s\n' "$page" "$jq"; exit 0 ;;
 esac
 exit 1

@@ -90,6 +90,12 @@ with `id: null` wasn't seen before, so it may already be resolved — reply with
 `{"root":N,"body":…}` and never resolve it. A foreground command that would have to wait
 more than ~90 s fails instead and names the reset time.
 
+The oracle's REST reads are conditional GETs over `${XDG_CACHE_HOME:-~/.cache}/pr-review/http`:
+what hasn't changed since any earlier read, in any process, comes back as a free 304. The
+watcher probes the same URLs, so a quiet PR costs nothing, and when something moves it
+re-reads only that: threads only if review comments moved, CI only if checks or HEAD did.
+Resolve/unresolve clicks are invisible to REST and show at the 5-minute full snapshot.
+
 ## Call log
 
 Every GitHub request these scripts (and `$GH`) make lands in SQLite at

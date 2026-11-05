@@ -14,8 +14,9 @@
 #   2. rl_interval: a watcher's poll interval spreads the budget left above a reserve
 #      (PR_REVIEW_RESERVE_PCT, default 20% of the limit, kept for the agent's own writes)
 #      over the time to reset; at the reserve it waits for the reset. /rate_limit is free.
-#   3. etag_changed: conditional GETs. A 304 costs no rate limit, so a watcher can ask
-#      "did anything move?" for free and skip the snapshot when nothing did.
+#   3. cget: conditional GETs over an on-disk cache. A 304 costs no rate limit, so a
+#      watcher can ask "did anything move?" for free and skip the snapshot when nothing
+#      did; the snapshot reads the same URLs, so what didn't move costs it nothing either.
 #   4. GraphQL → REST fallback where REST can answer: CI (ci_rest stands in for
 #      `gh pr checks`) and review threads (threads_rest). REST has no resolution state;
 #      it comes from a per-PR cache refreshed by every GraphQL thread read, trusted only
@@ -60,7 +61,7 @@ rl_status() {
 
 ghx() {
   local out err rc kind res=core delay=60 quick=1 w now rem reset ef a s end
-  for a in "${FUNCNAME[@]:1}"; do [ "$a" = api ] || break; done   # the call log's `caller`
+  for a in "${FUNCNAME[@]:1}"; do case $a in api|cget|cget_all) ;; *) break ;; esac; done   # the call log's `caller`
   local -x GH_LOG_CALLER=${GH_LOG_CALLER:-$a}
   for a in "$@"; do   # the bucket follows the endpoint, never a -f value that mentions one
     [ "$a" = graphql ] && res=graphql
@@ -145,20 +146,64 @@ rl_interval() {
 
 rest_preferred() { [ "${GQL_LOW:-0}" = 1 ] || [ "${PR_REVIEW_FORCE_REST:-}" = 1 ]; }
 
-# etag_changed <path> → 0 if the resource changed since the ETag recorded in ETAGS (or is
-# seen for the first time, or the request failed), 1 on 304 Not Modified. Records the new
-# ETag. Call directly, not in $(…). A 304 costs no rate limit; gh exits 1 on it, so the
-# status line decides, not the exit code.
-declare -gA ETAGS=()
-etag_changed() {
-  local h st et args=(-i --silent)
-  [ -n "${ETAGS[$1]:-}" ] && args+=(-H "If-None-Match: ${ETAGS[$1]}")
-  h=$(timeout 30 gh api "${args[@]}" "$1" 2>/dev/null)
-  st=$(head -n1 <<<"$h" | awk '{print $2}')
-  [ "$st" = 304 ] && return 1
-  et=$(grep -i '^etag:' <<<"$h" | head -n1 | cut -d' ' -f2- | tr -d '\r')
-  if [ "$st" = 200 ] && [ -n "$et" ]; then ETAGS[$1]=$et; else unset 'ETAGS[$1]'; fi
-  return 0
+# cget <path|url> [jq] → CGET_BODY (gh's --jq output, or the body) and CGET_NEXT (the
+# Link rel="next" URL); sets CGET_CHANGED=1 when GitHub sent fresh content (callers reset
+# it); returns 1 with gh's stderr in CGET_ERR. Call directly, not in $(…), where
+# CGET_CHANGED or the round memo matter.
+# Each response is kept on disk with its ETag, keyed by URL + filter, so the next read — in
+# this process or a later one — is a conditional GET: a 304 costs no rate limit and serves
+# the stored output, which is consistent with the server by construction (no ABA). Inside
+# one round (CGET_ROUND, reset by the caller) a key already read is served from disk with
+# no request at all; CGET_MEMO counts those. The filter still runs in gh (gojq), exactly
+# as `--paginate --jq` did. ponytail: no eviction — entries are a few KB per PR page.
+CGET_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/pr-review/http
+declare -gA CGET_ROUND=()
+CGET_CHANGED=0 CGET_MEMO=0
+cget() {
+  local url=$1 jq=${2:-} key f et='' out rc ef hdr st args=(-i)
+  key=$(printf '%s\0%s' "$url" "$jq" | sha1sum); key=${key%% *}; f=$CGET_DIR/$key
+  if [ -n "${CGET_ROUND[$key]:-}" ] && [ -f "$f" ]; then
+    { IFS= read -r _; IFS= read -r CGET_NEXT; CGET_BODY=$(cat); } <"$f"
+    CGET_MEMO=$((CGET_MEMO + 1)); return 0
+  fi
+  [ -f "$f" ] && IFS= read -r et <"$f"
+  [ -n "$et" ] && args+=(-H "If-None-Match: $et")   # never an empty one
+  [ -n "$jq" ] && args+=(--jq "$jq")
+  ef=$(mktemp) || { CGET_ERR="mktemp failed"; return 1; }
+  out=$(ghx "${args[@]}" "$url" 2>"$ef"); rc=$?
+  CGET_ERR=$(<"$ef"); rm -f "$ef"
+  # gh -i: status line, CRLF headers, a blank line, then the (filtered) body.
+  if [[ $out == *$'\n\r\n'* ]]; then hdr=${out%%$'\n\r\n'*} CGET_BODY=${out#*$'\n\r\n'}
+  elif [[ $out == *$'\n\n'* ]]; then hdr=${out%%$'\n\n'*} CGET_BODY=${out#*$'\n\n'}
+  else hdr=$out CGET_BODY=''; fi
+  hdr=${hdr//$'\r'/}; st=${hdr%%$'\n'*}; st=${st#* }; st=${st%% *}
+  if [ "$st" = 304 ] && [ -f "$f" ]; then            # gh exits 1 on a 304: the status decides
+    { IFS= read -r _; IFS= read -r CGET_NEXT; CGET_BODY=$(cat); } <"$f"
+  elif [ "$st" = 200 ] && [ "$rc" = 0 ]; then         # 200 with rc≠0 is a --jq error, not data
+    et=$(grep -i -m1 '^etag:' <<<"$hdr"); et=${et#*: }
+    CGET_NEXT=$(grep -i -m1 '^link:' <<<"$hdr" | grep -o '<[^>]*>; rel="next"'); CGET_NEXT=${CGET_NEXT#<}; CGET_NEXT=${CGET_NEXT%%>*}
+    CGET_CHANGED=1
+    if [ -n "$et" ]; then
+      # shellcheck disable=SC2174  # only the cache dir itself needs 700
+      mkdir -p -m 700 "$CGET_DIR" && printf '%s\n%s\n%s' "$et" "$CGET_NEXT" "$CGET_BODY" >"$f.$$" && mv -f "$f.$$" "$f"
+    else rm -f "$f"; fi                              # no ETag: nothing to be conditional on
+  else
+    [ -n "$CGET_ERR" ] || CGET_ERR="HTTP ${st:-?}: ${out:0:200}"
+    return 1
+  fi
+  CGET_ROUND[$key]=1
+}
+
+# cget_all <path> [jq] → CGET_BODY holds every page's output, following Link rel="next";
+# the drop-in for `ghx --paginate <path> --jq <jq>`.
+cget_all() {
+  local url=$1 all=''
+  while [ -n "$url" ]; do
+    cget "$url" "${2:-}" || return 1
+    [ -n "$CGET_BODY" ] && all+=${all:+$'\n'}$CGET_BODY
+    url=$CGET_NEXT
+  done
+  CGET_BODY=$all
 }
 
 # ---------------------------------------------------------------- CI
@@ -169,6 +214,10 @@ CI_BUCKET='if .status != "completed" then "pending"
   elif .conclusion == "stale" then "pending"
   else "fail" end'
 STATUS_BUCKET='if .state == "success" then "pass" elif .state == "pending" then "pending" else "fail" end'
+# Filters shared with pr-state.sh's probes, so a probe and ci_rest read one cache entry.
+CI_RUNS_JQ='.check_runs[] | {name, suite: .check_suite.id, app: .app.slug, at: (.started_at // ""),
+  link: .html_url, bucket: ('"$CI_BUCKET"')}'
+CI_STATUS_JQ=".statuses[] | {name: .context, bucket: ($STATUS_BUCKET), link: .target_url}"
 
 # ci_rest <repo> <sha> → [{name, bucket, link}], the same rows `gh pr checks` shows.
 # Matched empirically against gh on 14 PRs (worker#195 forced the rules): GraphQL's
@@ -177,13 +226,13 @@ STATUS_BUCKET='if .state == "success" then "pass" elif .state == "pending" then 
 # name + workflow + event. Non-Actions apps (Socket, Vercel) have no workflow run.
 ci_rest() {
   local runs wf st
-  runs=$(ghx --paginate "repos/$1/commits/$2/check-runs?per_page=100" --jq '.check_runs[]
-    | {name, suite: .check_suite.id, app: .app.slug, at: (.started_at // ""), link: .html_url,
-       bucket: ('"$CI_BUCKET"')}' 2>&1) || { echo "$runs"; return 1; }
-  wf=$(ghx --paginate "repos/$1/actions/runs?head_sha=$2&per_page=100" \
-    --jq '.workflow_runs[] | {suite: .check_suite_id, wf: .name, event}' 2>&1) || { echo "$wf"; return 1; }
-  st=$(ghx --paginate "repos/$1/commits/$2/status?per_page=100" \
-    --jq ".statuses[] | {name: .context, bucket: ($STATUS_BUCKET), link: .target_url}" 2>&1) || { echo "$st"; return 1; }
+  cget_all "repos/$1/commits/$2/check-runs?per_page=100" "$CI_RUNS_JQ" || { echo "$CGET_ERR"; return 1; }
+  runs=$CGET_BODY
+  cget_all "repos/$1/actions/runs?head_sha=$2&per_page=100" \
+    '.workflow_runs[] | {suite: .check_suite_id, wf: .name, event}' || { echo "$CGET_ERR"; return 1; }
+  wf=$CGET_BODY
+  cget_all "repos/$1/commits/$2/status?per_page=100" "$CI_STATUS_JQ" || { echo "$CGET_ERR"; return 1; }
+  st=$CGET_BODY
   jq -nc --slurpfile r <(printf '%s\n' "$runs") --slurpfile w <(printf '%s\n' "$wf") \
          --slurpfile s <(printf '%s\n' "$st") '
     ($w | map({key: (.suite | tostring), value: .}) | from_entries) as $wm
@@ -223,11 +272,12 @@ tcache_put() { # <repo> <pr>, lines on stdin
 # threads_rest <repo> <pr> <n>: id (GraphQL node id) and resolved come from the cache —
 # null / false when the thread isn't cached, and resolved only while the count is unchanged
 # (a reply after the cached read may have reopened it).
+THREADS_REST_JQ='.[] | {root: (.in_reply_to_id // .id), by: .user.login, at: .created_at, path,
+  line: (.line // .original_line), body, url: .html_url, down: (.reactions["-1"] // 0)}'
 threads_rest() {
   local cm f
-  cm=$(ghx --paginate "repos/$1/pulls/$2/comments?per_page=100" --jq '.[] | {root: (.in_reply_to_id // .id),
-        by: .user.login, at: .created_at, path, line: (.line // .original_line), body, url: .html_url,
-        down: (.reactions["-1"] // 0)}' 2>&1) || { echo "$cm"; return 1; }
+  cget_all "repos/$1/pulls/$2/comments?per_page=100" "$THREADS_REST_JQ" || { echo "$CGET_ERR"; return 1; }
+  cm=$CGET_BODY
   f=$(tcache_file "$1" "$2"); [ -f "$f" ] || f=/dev/null
   printf '%s\n' "$cm" | jq -c -s --rawfile cache "$f" --argjson n "$3" '
     ($cache | split("\n") | map(split("\t") | select(length == 4)
@@ -330,6 +380,25 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   e "ghx: reset past the deadline → fails at once" "$(( $(date +%s) - t0 <= 2 ))" 1
   err=$(GH_RL_MAX_WAIT=0 ghx -X POST repos/o/r/issues/1/comments -f body="mentions graphql here" 2>&1 >/dev/null)
   e "ghx: the bucket follows the endpoint, not a -f value" "${err:0:18}" "rate limited (core"
+
+  # cget against the same fake: storage, 304 replay, the round memo, pages, filters, errors.
+  export FAKE_MODE=http; CGET_DIR=$fk/http; : >"$FAKE_LOG"
+  CGET_ROUND=(); CGET_CHANGED=0; cget_all p1 F
+  e "cget: a first read fetches every page"          "$CGET_BODY|$(calls)|$CGET_CHANGED" $'data-p1-F\ndata-p2-F|2|1'
+  e "cget: the cache dir is private"                 "$(stat -c %a "$CGET_DIR")" 700
+  CGET_ROUND=(); CGET_CHANGED=0; : >"$FAKE_LOG"; cget_all p1 F
+  e "cget: next round → conditional 304s, same body" \
+    "$CGET_BODY|$(calls)|$CGET_CHANGED|$(grep -c 'If-None-Match: W/"e-p1-1"' "$FAKE_LOG")" $'data-p1-F\ndata-p2-F|2|0|1'
+  : >"$FAKE_LOG"; m0=$CGET_MEMO; cget_all p1 F
+  e "cget: same round → no request at all"           "$CGET_BODY|$(calls)|$((CGET_MEMO - m0))" $'data-p1-F\ndata-p2-F|0|2'
+  : >"$FAKE_LOG"; cget p1 G
+  e "cget: another filter is another entry"          "$CGET_BODY|$(calls)" "data-p1-G|1"
+  export FAKE_VER=2; CGET_ROUND=(); CGET_CHANGED=0; cget p1 F; unset FAKE_VER
+  e "cget: a new ETag → fresh read, marked changed"  "$CGET_BODY|$CGET_CHANGED" "data-p1-F|1"
+  export FAKE_NOETAG=1; CGET_ROUND=(); : >"$FAKE_LOG"; cget q F; cget q F; unset FAKE_NOETAG
+  e "cget: no ETag → nothing kept, never an empty If-None-Match" "$(calls)|$(grep -c If-None-Match "$FAKE_LOG")" "2|0"
+  cget fail F; w=$?
+  e "cget: an error returns 1 with gh's stderr"      "$w|$CGET_ERR" "1|gh: Server Error (HTTP 500)"
 
   # bin/gh against the same fake (which bin/gh finds as the real gh behind it on PATH).
   py=/usr/bin/python3; [ -x "$py" ] || py=python3
